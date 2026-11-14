@@ -1,0 +1,13 @@
+[package]
+name = "bt-chain"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+subxt.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
