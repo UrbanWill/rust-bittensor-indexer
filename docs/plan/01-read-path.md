@@ -2,11 +2,20 @@
 
 This stage reads real chain data at old blocks, one value per step, and prints it with a `bt-indexer chain ...` command. By its end you have the true shape of `Chain` and `BlockSource`. It closes no roadmap check yet. It shows the decoding rule of [D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec) at a real upgrade block before any database or runner code depends on it. Storage and events of block n decode with the metadata of the spec that executed n, and a runtime API call at n uses the metadata of n's own state spec. Release 1 reads only specs 475 to 490 ([D3](../decisions.md#d3-set-the-milestone-scope-by-what-release-1-reads)), but the rule shows only at an upgrade block, so the checks use the dTAO upgrade at 4,920,350.
 
-Before you start, set `BT_CHAIN__URLS` in your shell to an archive node's `wss://` URL. If the URL carries a key after a `?`, put it in single quotes, because the shell treats a `?` as a pattern.
+Before you start, put an archive node's `wss://` URL in `.env` at the repository root. `.env` is ignored by git, because the URL can carry a key. `.env.example` lists the variables, and `.envrc` tells [direnv](https://direnv.net) to load `.env` when you enter the repository and unload it when you leave.
 
 ```sh
-export BT_CHAIN__URLS='wss://<archive node>:443'
+cp .env.example .env
+direnv allow
 ```
+
+Then edit `.env`. Keep the single quotes when the URL carries a key after a `?`.
+
+```sh
+BT_CHAIN__URLS='wss://<archive node>:443'
+```
+
+direnv needs its hook in your shell's startup file, `eval "$(direnv hook zsh)"` for zsh. It prints `direnv: export +BT_CHAIN__URLS` when it loads the file. The binary never reads `.env`. It reads the environment, so a deployment sets the same variable its own way.
 
 The keyed archive node allows 200 calls a second per key and answers JSON-RPC `-32029` above that. The same gateway with no key accepts the connection and allows 10 calls a second, so a URL that lost its key starts fine and then answers mostly `-32029` (`spikes/crates/chain-errors`, `gateway-keyless`). The public archive node runs at about 9 calls a second at 4 in flight, measured on 2026-11-12 (`spikes/crates/chain-errors`, `P32`). Every check in this stage makes only a few calls, so wait a minute and run it again if you see `-32029`.
 
@@ -34,7 +43,7 @@ git status --short
 rustc --version
 ```
 
-Expect `rustc 1.99.1` or later. The repository starts as a `cargo init` package. It tracks `Cargo.toml`, `src/main.rs`, and a `.gitignore` that holds `/target`, and `git status` shows only `A  Cargo.lock`. Keep the staged `Cargo.lock`. A workspace with a binary commits its lock file, and the first build rewrites it.
+Expect `rustc 1.99.1` or later. The repository starts as a `cargo init` package. It tracks `Cargo.toml`, `src/main.rs`, and a `.gitignore`, and `git status` shows only `A  Cargo.lock`. Keep the staged `Cargo.lock`. A workspace with a binary commits its lock file, and the first build rewrites it.
 
 This step's commit holds only the workspace. If `git status` shows other changes, such as the docs, commit them first in a commit of their own. Name their paths, so the staged `Cargo.lock` stays out of that commit.
 
@@ -286,8 +295,8 @@ Two more runs show the rule from both sides.
 | `error[E0599]: no method named 'number' found for struct 'SubstrateHeader<Hash>'` | Add `Header` to the `subxt::config` import. `number()` is a trait method. |
 | `` error[E0277]: `?` couldn't convert the error to `ChainError` `` | Add `.map_err(unknown)` before the `?`. The RPC calls return `subxt_rpcs::Error`, and `unknown` converts it through `subxt::Error`. |
 | `error: missing documentation for a struct field` | Add a `///` line above that field. |
-| `error: the following required arguments were not provided: --url <URL>` | Run the `export BT_CHAIN__URLS=...` line in this shell. |
-| `Error: node error` with `Too Many Requests` | The node limits calls (`-32029`). If it comes on the first few calls, the URL has probably lost its key (see the top of this stage), so check that the `export` line quotes it. Otherwise wait a minute and run the command again. |
+| `error: the following required arguments were not provided: --url <URL>` | The variable is not set. Run `direnv allow` in the repository root and check that `.env` holds `BT_CHAIN__URLS`. |
+| `Error: node error` with `Too Many Requests` | The node limits calls (`-32029`). If it comes on the first few calls, the URL has probably lost its key (see the top of this stage), so check that the line in `.env` quotes it. Otherwise wait a minute and run the command again. |
 | `Error: node error` with `status code: 403` | The key in the URL is wrong. The gateway rejects the connection in about 0.3 s (`spikes/crates/chain-errors`, `gateway-handshake-rejected`). |
 | `Error: node error` with `status code: 404` | The path in the URL is wrong. An unrouted path such as `/zzz` gives 404 (`spikes/crates/chain-errors`, `gateway-handshake-rejected`). |
 | `Error: node error` with `Connection refused` or a TLS error | Check that the URL starts with `wss://` and ends with `:443`. |
