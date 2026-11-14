@@ -6,7 +6,7 @@ Release 1 serves only the numbers in [compatibility numbers](#compatibility-numb
 
 All amounts are integers in rao or raw alpha units (10^9 per whole alpha) until the last step. Ratios are computed in `f64` (or `float8` in SQL) at query time and are never stored as amounts.
 
-Citations use two roots. `S/` is the reference squid, `bittensor-squid/`. `T/` is `tao-data-api/src/`.
+Citations use two roots. `S/` is the reference squid, `bittensor-squid/`. `T/` is `tao-data-api/src/`. After a file's first citation in a section, later citations give its file name only.
 
 ## Compatibility numbers
 
@@ -30,70 +30,50 @@ These numbers feed the five routes in [API](05-api.md#compatibility-routes). Eac
 | `netuid` | | JSON integer |
 | `total_tao` | rao, integer | `tao_reserve`, which is `SubnetTAO + SubnetTaoProvided` (`pools.ts:74`) |
 | `total_alpha` | raw alpha, integer | `alpha_reserve + alpha_out` (`pools.ts:75`). Sum the two in Rust as `u64`. Each is below 2^63, so the sum fits |
-| `price` | TAO per alpha, decimal | `fmt_scaled(price, 9)` (`pools.ts:6-15,121`) |
-| `market_cap` | rao, decimal | `fmt_scaled(price × total_alpha, 9)`, with the product in `u128` (`pools.ts:26-35,123`) |
+| `price` | TAO per alpha, decimal | `fmt_scaled::<9>(price)` (`pools.ts:6-15,121`) |
+| `market_cap` | rao, decimal | `fmt_scaled::<9>(price × total_alpha)`, with the product in `u128` (`pools.ts:26-35,123`) |
 | `price_change_1_day` | percent, decimal | See below (`pools.ts:87-108`) |
 | `tao_volume_24_hr` | rao, integer | `lifetime_volume(current) − lifetime_volume(day-ago)`. It is `"0"` when there is no day-ago row or when the counter went down (`pools.ts:110-115`) |
 
 `price` is the stored integer in rao per whole alpha. `market_cap` is in rao, not TAO, and keeps up to 9 fraction digits. Both inputs come from `BIGINT` columns, so each is below 2^63, and the product fits `u128`.
 
-**Decimal format.** `fmt_scaled(v, s)` prints the integer `v` divided by 10^s.
+**Decimal format.** `fmt_scaled::<S>(v)` prints the integer `v` divided by 10^S.
 
-- The integer part is `v / 10^s`.
-- The fraction is `v mod 10^s`, padded to `s` digits, with trailing zeros removed.
+- The integer part is `v / 10^S`.
+- The fraction is `v mod 10^S`, padded to `S` digits, with trailing zeros removed.
 - With no fraction left, there is no decimal point. Zero is `"0"`.
 
 **Price change.** Let `cur` be the current price and `old` the day-ago price, both integers in rao per alpha.
 
 - If there is no day-ago row, or `old` is 0, the value is `"0"`.
 - Otherwise `scaled = trunc((cur − old) × 10^18 / old)`, where `trunc` rounds toward zero, as JavaScript `BigInt` division does.
-- The squid multiplies `scaled` by 100 and prints it with 18 fraction digits. That is the same string as `fmt_scaled(|scaled|, 16)`, so the value has at most 16 fraction digits.
+- The squid multiplies `scaled` by 100 and prints it with 18 fraction digits. That is the same string as `fmt_scaled::<16>(|scaled|)`, so the value has at most 16 fraction digits.
 - A negative `scaled` gets a `-` prefix. A change that truncates to 0 is `"0"`, with no sign.
 - For example, `cur = 1` and `old = 3` give `"-66.6666666666666666"`.
 
 A subnet younger than about 24 hours, or one with no row in the 24 to 26 hour window, therefore reports `price_change_1_day = "0"` and `tao_volume_24_hr = "0"`, not null. No `/pools` field is ever null.
 
-**Rust helpers.** These functions use integer math only. Run against the squid's own `raoToTao`, `computeMarketCap`, price-change, and volume code on 20,006 inputs across the full `u64` range, they produced identical strings for every input.
+**Rust helpers.** These functions use integer math only. `bt-domain` denies `clippy::arithmetic_side_effects` with `#![deny(clippy::arithmetic_side_effects)]` at the top of `crates/domain/src/lib.rs` ([error handling](06-error-handling.md)), so their bodies use only operations that lint accepts ([D27](../decisions.md#d27-hold-amounts-in-u128-and-write-the-format-helpers-lint-clean)). The signatures are these.
 
 ```rust
-/// Prints `value / 10^scale` with at most `scale` fraction digits, trailing zeros removed.
-pub fn fmt_scaled(value: u128, scale: u32) -> String {
-	let div = 10u128.pow(scale);
-	let (int, frac) = (value / div, value % div);
-	if frac == 0 {
-		return int.to_string();
-	}
-	let digits = format!("{frac:0width$}", width = scale as usize);
-	format!("{int}.{}", digits.trim_end_matches('0'))
-}
-
-pub fn rao_to_tao(rao: u64) -> String {
-	fmt_scaled(rao.into(), 9)
-}
-
-pub fn market_cap(price: u64, total_alpha: u64) -> String {
-	fmt_scaled(u128::from(price) * u128::from(total_alpha), 9)
-}
-
-pub fn price_change_1_day(cur: u64, old: Option<u64>) -> String {
-	let Some(old) = old.filter(|&old| old > 0) else {
-		return "0".to_owned();
-	};
-	// |cur − old| < 2^64, so the product stays below 1.9 × 10^37 and fits i128.
-	let scaled = (i128::from(cur) - i128::from(old)) * 10i128.pow(18) / i128::from(old);
-	let body = fmt_scaled(scaled.unsigned_abs(), 16);
-	if scaled < 0 { format!("-{body}") } else { body }
-}
-
-pub fn tao_volume_24_hr(cur: u128, old: Option<u128>) -> u128 {
-	match old {
-		Some(old) if cur >= old => cur - old,
-		_ => 0,
-	}
-}
+/// Prints `value / 10^SCALE` with at most `SCALE` fraction digits, trailing zeros removed.
+pub fn fmt_scaled<const SCALE: u32>(value: u128) -> String;
+pub fn rao_to_tao(rao: u64) -> String;
+pub fn market_cap(price: u64, total_alpha: u64) -> String;
+pub fn price_change_1_day(cur: u64, old: Option<u64>) -> String;
+pub fn tao_volume_24_hr(cur: u128, old: Option<u128>) -> u128;
 ```
 
-Rust's `/` on `i128` truncates toward zero, as `BigInt` does. The ×100 step disappears because printing `scaled × 100` with 18 digits equals printing `scaled` with 16.
+The bodies are in `spikes/crates/api/src/format_lint.rs`. The lint rejects plain `/` and `%` in `fmt_scaled`, the `u128` product in `market_cap`, an `i128` expression in `price_change_1_day`, and `cur - old` in `tao_volume_24_hr` (`spikes/crates/api`, `P33`). Each body uses an operation the lint accepts instead.
+
+- `fmt_scaled` divides by `const { NonZeroU128::new(10u128.pow(SCALE)).unwrap() }`. The divisor is computed at compile time, so a `SCALE` above 38 fails the build.
+- `market_cap` multiplies with `u128::strict_mul`. Two `u64` values always fit a `u128` product.
+- `price_change_1_day` filters `old` through `NonZeroU64`, computes `u128::from(cur.abs_diff(old)).strict_mul(10^18) / NonZeroU128::from(old)`, and adds the `-` only when `cur < old` and the result is not 0. `|cur − old| × 10^18` stays below 2^128.
+- `tao_volume_24_hr` is `old.and_then(|old| cur.checked_sub(old)).unwrap_or(0)`.
+
+These bodies produce the same strings as the squid's `pools.ts` code on 27,026 rows (`spikes/crates/api`, `P33-lint-clean`).
+
+The division truncates toward zero, as `BigInt` does, because it runs on the absolute difference and the sign is added afterwards. The ×100 step disappears because printing `scaled × 100` with 18 digits equals printing `scaled` with 16.
 
 ### `/validators`
 
@@ -143,9 +123,9 @@ Both APY values are fractions. 0.59 means 59%.
 
 Dividends compound. Each epoch's dividend raises the validator's stake, and the next epoch pays on the larger amount. The APY therefore compounds the per-epoch yields and annualizes them (`S/api/src/routes/validators.ts:44-116`, explained at `:13-43`).
 
-The inputs come from `epoch_dividend`. The `epochs` job writes one row for each `(netuid, hotkey)` with nonzero `AlphaDividendsPerSubnet` at each block where `LastMechansimStepBlock(netuid)` equals the block number. `stake_at_epoch` is `TotalHotkeyAlphaLastEpoch`, or 0 before spec 261 (`S/src/main.ts:2157-2212`). Netuid 0 has no rows.
+The inputs come from `epoch_dividend`. The `epochs` job writes one row for each `(netuid, hotkey)` with nonzero `AlphaDividendsPerSubnet` at each block where `LastMechansimStepBlock(netuid)` equals the block number. `stake_at_epoch` is `TotalHotkeyAlphaLastEpoch`. The squid stores 0 before spec 261 (`S/src/main.ts:2157-2212`). Our decoder returns `None` there ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)), and release 1 never reads that era. What a full-history job stores there is an open question in the [release 2 outline](../plan/release-2-outline.md). Netuid 0 has no rows.
 
-**The anchor.** Let `H` be the `last_block_ts` of the `epochs` checkpoint, the chain time of the newest block the job has committed. Every window below uses `H`. The squid filters rows by wall-clock `NOW()` and annualizes from `MAX(block.timestamp)` (`validators.ts:57,73,113`). When the indexer is caught up, the two anchors differ by about 24 seconds. When it lags, our rows and our window still describe the same 30 days. This is a deliberate deviation.
+**The anchor.** Let `H` be the `last_block_ts` of the `epochs` checkpoint, the chain time of the newest block the job has committed. Every window below uses `H`. The squid filters rows by wall-clock `NOW()` and annualizes from `MAX(block.timestamp)` (`validators.ts:57,73,113`). When the indexer is caught up, the two anchors differ by about 24 seconds, the two blocks between the best and the finalized head (`spikes/crates/chain-errors`, `finality-gap`). When it lags, our rows and our window still describe the same 30 days. This is a deliberate deviation.
 
 For a hotkey `h` on netuid `n ≠ 0`:
 
@@ -164,6 +144,10 @@ For a hotkey `h` on netuid `n ≠ 0`:
 | any other case | null | null |
 
 (`validators.ts:63-85` for net, `:86-109` for gross.)
+
+A value that is not a finite `f64`, such as a compounded value that overflows, is null ([D29](../decisions.md#d29-return-a-null-apy-where-the-squids-sql-errors)). Against the squid's own SQL on PostgreSQL 17, the formula above matched in 27 of 30 cases with a largest relative difference of 1.0 × 10^-12 (`spikes/crates/api`, `apy-formula`).
+
+The other 3 cases are where the squid's SQL raises an error and fails its whole route: `division by zero` for a 100 % take with 10 or more earning epochs, and `value out of range: overflow` when the compounded value overflows. Ours answers the route, with gross null at a 100 % take as the table says, and with net and gross null on overflow. `compat diff` treats a squid 500 on those rows as expected.
 
 - The take row wins for gross. A hotkey at 100% take that earned nothing on a measurable subnet has net 0 and gross null.
 - A hotkey with 1 to 9 rows in `E` gets null on every subnet, measurable or not.
@@ -215,11 +199,11 @@ The validator `name` and the eight `/v1/subnet-identities` text fields decode ch
 
 `name` comes from `IdentitiesV2(Owner(hotkey)).name`. It is null when the hotkey has no owner or the owner has no identity (`S/src/main.ts:1771-1830,1848`).
 
-The squid trims with JavaScript's `String.prototype.trim`, whose whitespace set differs from Rust's `str::trim`. JavaScript trims U+FEFF and keeps U+0085. Rust does the opposite. `String::from_utf8_lossy` then this function matched Node's `Buffer.toString('utf8')` and `trim` on 13 test inputs, including truncated, overlong, and surrogate sequences.
+The squid trims with JavaScript's `String.prototype.trim`, whose whitespace set differs from Rust's `str::trim`. JavaScript trims U+FEFF and keeps U+0085. Rust does the opposite. `String::from_utf8_lossy` followed by this function must match Node's `Buffer.toString('utf8')` and `trim`, including on truncated, overlong, and surrogate sequences. The identity decoder's tests compare the two on such inputs.
 
 ```rust
 fn trim_js(s: &str) -> &str {
-	s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+    s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
 }
 ```
 

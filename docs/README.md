@@ -1,6 +1,6 @@
 # Design documentation
 
-These documents describe the Bittensor indexer before any code exists. The indexer replaces the reference squid for tao-data-api, and then adds its own analytics. The documents record what the indexer stores, how it reads the chain, what it serves, and why each design choice was made. Read them in order the first time.
+These documents describe the Bittensor indexer before its product code is written. The probes they rest on are described under [Evidence](#evidence). The indexer replaces the reference squid for tao-data-api, and then adds its own analytics. The documents record what the indexer stores, how it reads the chain, what it serves, and why each design choice was made. Read them in order the first time. The [implementation plan](plan/README.md) turns them into the steps that build release 1.
 
 | Document | What it answers |
 |---|---|
@@ -16,10 +16,16 @@ These documents describe the Bittensor indexer before any code exists. The index
 | [Roadmap](design/10-roadmap.md) | Milestones and the check that closes each one |
 | [Decisions](decisions.md) | One entry per architecture decision, with the alternatives we rejected |
 
+## Evidence
+
+Each claim about the chain, the node, the database, or a library rests on a probe, a small program that runs one command and prints what happened. The probes and their results live in a separate repository, `rust-bittensor-indexer-rnd`, so that this one holds only the docs and what ships.
+
+Every path in these docs that starts with `spikes/` is a path in that repository. A citation such as (`spikes/crates/chain-specs`, `P30`) names the probe crate and the row of its ledger. `spikes/README.md` there merges every row into one evidence ledger, with the command behind each row, what it printed, and the date.
+
 ## Sources
 
 Three local repositories informed these documents.
 
-- **tao-data-api** at `/home/urban/Work/talisman/tao-data-api` is the contract. It is a Cloudflare Worker that reads the indexer through `INDEXER_DATA_API_1` and `INDEXER_DATA_API_2` (`src/common/indexer.ts`). The indexer is compatible when tao-data-api's five indexer calls get the same response shapes and values from it as from the squid. [API](design/05-api.md#compatibility-routes) gives those calls field by field. Citations into this repository start with `tao-data-api/`.
-- **The reference squid** at `/home/urban/Work/talisman/bittensor-squid` is a TypeScript Subsquid indexer for the same chain. It is a data reference only. We take its meaning of each value that tao-data-api receives. We do not copy its code, its GraphQL API, its other routes, or its cadences and workarounds, unless a value tao-data-api receives depends on them. Citations into this repository start with `bittensor-squid/`.
+- **tao-data-api**, a checkout at commit `6a46bbf`, is the contract. It is a Cloudflare Worker that reads the indexer through `INDEXER_DATA_API_1` and `INDEXER_DATA_API_2` (`src/common/indexer.ts`). The indexer is compatible when tao-data-api's five indexer calls get the same response shapes and values from it as from the squid. [API](design/05-api.md#compatibility-routes) gives those calls field by field. Citations into this repository start with `tao-data-api/`.
+- **The reference squid**, a bittensor-squid checkout, is a TypeScript Subsquid indexer for the same chain. It is a data reference only. We take its meaning of each value that tao-data-api receives. We do not copy its code, its GraphQL API, its other routes, or its cadences and workarounds, unless a value tao-data-api receives depends on them. Citations into this repository start with `bittensor-squid/`.
 - **The subtensor node** at `../subtensor`, at commit `d967d1358` (spec version 490). It defines every storage item, runtime API, and event we read. Paths in these docs that start with `pallets/`, `primitives/`, `common/`, or `runtime/` point into that repository.

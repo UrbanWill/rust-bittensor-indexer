@@ -14,93 +14,122 @@ Subtensor is a Substrate chain with about 12-second blocks. These parts of its m
 - A **coldkey** owns funds. A **hotkey** is the key that a validator or miner runs with. Stake belongs to a (coldkey, hotkey, subnet) triple.
 - Staking TAO into a subnet is a swap. The TAO goes into the subnet's pool and the staker receives alpha. Unstaking is the reverse swap. The [price section](#price-comes-from-a-weighted-balancer-pool) describes the pool.
 - Each subnet runs an **epoch** every `Tempo` blocks. The epoch computes incentives and dividends. Since spec 475, a subnet runs either Yuma consensus or Null consensus (`EpochConsensus` in `pallets/subtensor/src/lib.rs:627`). Null consensus uses the weights of the validator with the largest stake.
-- **Root Reborn** (spec 441) added validator **baskets**. A basket is a fund of alpha holdings that root stakers own shares of. Root claims still exist after spec 441, and `RootClaimed` still fires (`pallets/subtensor/src/staking/claim_root.rs:1368`).
+- **Root Reborn** (spec 441) added validator **baskets**. A basket is a fund of alpha holdings that root stakers own shares of. Root claims run alongside baskets, and `RootClaimed` fires on both sides of spec 441 (`pallets/subtensor/src/staking/claim_root.rs:1368`).
 
 ## Date each item by the block's metadata
 
-The spec numbers in this document come from subtensor's git history. A script walks the 213 spec-bump commits on `main` and records the first spec whose commit contains each item. Commit order is close to on-chain order, but mainnet did not run every spec. The reference squid's types, generated from mainnet metadata, show the first mainnet spec where they differ. For example, the swap V3 storage is in the spec 283 commit, but the first mainnet runtime with it is 290. The squid has `src/types/v290.ts` and no `v283.ts`.
+The spec numbers in this document come from subtensor's git history. Each is the first of the 213 spec-bump commits on `main` that contains the item. Commit order is close to on-chain order, but mainnet did not run every spec. Where the first mainnet spec differs, it follows in parentheses. For example, the swap V3 storage is in the spec 283 commit, but the first mainnet runtime with it is 290. The squid has `src/types/v290.ts` and no `v283.ts`.
 
-The jobs therefore never branch on a spec number alone. Each job asks the metadata cache whether the block's metadata declares the storage item, runtime API, or event it needs. Metadata V15, which spec 233 already exposes, lists runtime APIs too. The spec numbers below say when to expect a change. The metadata decides.
+`spikes/data/specs.csv` holds the 106 specs that mainnet ran from dTAO to 2026-11-12, 233 to 490, with the upgrade block and date of each (`spikes/crates/chain-specs`, `spec-list`). Mainnet never ran 275, 283, 384, 390, 428, 460 or 461. The upgrade block of a spec is the first block whose state reports it, the `first_state_block` column of that file. The previous spec executed that block, and the new spec executes from the next one.
+
+The jobs therefore never branch on a spec number alone. Each job asks the metadata cache whether the right metadata declares the storage item, runtime API, or event it needs. For storage and events at block `n`, that is the metadata of the spec that executed `n`. For a runtime API at `n`, it is the metadata of `n`'s own state spec. [Decode each block](#decode-each-block-with-the-metadata-of-the-runtime-that-ran-it) gives the rule. Metadata V15, which spec 233 already serves through `Metadata_metadata_at_version`, lists runtime APIs too. The spec numbers below say when to expect a change. The metadata decides.
 
 ## Read this chain state in release 1
 
 Release 1 decodes no events. It runs five jobs that read storage and runtime APIs at scheduled blocks. [Ingestion](03-ingestion.md#run-every-job-on-one-runner) describes how the runner schedules them.
 
+Release 1's windows reach back only to block 9,260,462, where the 31-day window starts at the head of 9,490,862 measured on 2026-11-12 (`spikes/crates/chain-specs`, `P29`). Release 1 therefore reads specs 475 to 490 and nothing older ([D3](../decisions.md#d3-set-the-milestone-scope-by-what-release-1-reads)). The `prices` window of 2 days starts at spec 488. The older eras below matter for release 2, and the fixtures of milestone M0 ([roadmap](10-roadmap.md)) test them for it.
+
 | Job (`worker` label) | Schedule | History it keeps | Reads | Writes |
 |---|---|---|---|---|
 | `prices` | every block | `Window(2 days)` by default | the price (see [the eras](#price-comes-from-a-weighted-balancer-pool)), plus `SubnetTAO`, `SubnetTaoProvided` (specs 290 to 422), `SubnetAlphaIn`, `SubnetAlphaInProvided` (specs 290 to 422), `SubnetAlphaOut`, and `SubnetVolume` (`u128`) for every netuid in `NetworksAdded` except 0 | `subnet_price` |
 | `validators` | blocks where `n % 100 == 0` | `Latest` | `Delegates`, `NetworksAdded`, `SubnetMovingPrice`, `TaoWeight`, `TotalHotkeyAlpha` (paged), `AlphaDividendsPerSubnet`, `StakingHotkeys` (paged), `Owner`, `IdentitiesV2` | `validator`, `validator_subnet` (the whole set is replaced in one transaction) |
-| `epochs` | every block | `Window(31 days)` | `LastMechansimStepBlock` for every netuid. For subnets whose value equals `n`, also `AlphaDividendsPerSubnet` and `TotalHotkeyAlphaLastEpoch` (0 before spec 261). Netuid 0 is skipped | `epoch_dividend` |
+| `epochs` | every block | `Window(31 days)` | `LastMechansimStepBlock` for every netuid. For subnets whose value equals `n`, also `AlphaDividendsPerSubnet` and `TotalHotkeyAlphaLastEpoch` (not declared before spec 261). Netuid 0 is skipped | `epoch_dividend` |
 | `baskets` | blocks where `n % 500 == 0`, from spec 441 | `Window(31 days)` | `BetaBasketRuntimeApi.get_all_validator_baskets` and `BasketRate` | `basket_snapshot` |
-| `identities` | blocks where `n % 100 == 0` | `Latest` | `SubnetIdentitiesV3` (spec 283 and later) | `subnet_identity` (the whole set is replaced) |
+| `identities` | blocks where `n % 100 == 0` | `Latest` | `SubnetIdentitiesV3` (declared from spec 283, 290 on mainnet, but see the [note on V3](#storage-items-and-runtime-apis)) | `subnet_identity` (changed rows are written and vanished rows deleted) |
 
 [Compatibility numbers](08-analytics.md#compatibility-numbers) defines what the API computes from these rows.
 
 ### Storage items and runtime APIs
 
-All storage items below are in `SubtensorModule` unless the table names another pallet. "From spec" is the first spec-bump commit that has the item, with the first mainnet spec in parentheses where the two differ.
+All storage items below are in `SubtensorModule` unless the table names another pallet. "From spec" is the first spec-bump commit that has the item, with the first mainnet spec in parentheses where the two differ. "Key" names the hasher. "Decodes as" is the Rust type that decoded the item through `DecodeAsType` in every mainnet era, 35 of 35 cases (`spikes/crates/chain-decode`, `decode-table`; `spikes/data/decode-cases.csv`). At its 8 upgrade blocks the table decodes with the executing spec's metadata, as the rule [below](#decode-each-block-with-the-metadata-of-the-runtime-that-ran-it) sets.
 
-| Item | Declared at | Key | Value | From spec |
-|---|---|---|---|---|
-| `NetworksAdded` | `pallets/subtensor/src/lib.rs:2675` | `NetUid` | `bool` | 233 |
-| `SubnetTAO` | `pallets/subtensor/src/lib.rs:2061` | `NetUid` | `TaoBalance` (`u64`) | 233 |
-| `SubnetAlphaIn` | `pallets/subtensor/src/lib.rs:2103` | `NetUid` | `AlphaBalance` (`u64`) | 233 |
-| `SubnetAlphaOut` | `pallets/subtensor/src/lib.rs:2108` | `NetUid` | `AlphaBalance` (`u64`) | 233 |
-| `SubnetTaoProvided`, `SubnetAlphaInProvided` | `pallets/subtensor/src/migrations/migrate_cleanup_swap_v3.rs:11,16` | `NetUid` | `u64` | 283 (290) to 422 |
-| `SubnetVolume` | `pallets/subtensor/src/lib.rs:2056` | `NetUid` | `u128` | 233 |
-| `SubnetMovingPrice` | `pallets/subtensor/src/lib.rs:2034` | `NetUid` | `I96F32` | 233 |
-| `TaoWeight` | `pallets/subtensor/src/lib.rs:1742` | none | `u64` | 233 |
-| `Delegates` | `pallets/subtensor/src/lib.rs:1795` | hotkey | `PerU16` (a `u16`; plain `u16` at spec 233) | 233 |
-| `TotalHotkeyAlpha` | `pallets/subtensor/src/lib.rs:2191` | (hotkey, `NetUid`) | `AlphaBalance` | 233 |
-| `TotalHotkeyAlphaLastEpoch` | `pallets/subtensor/src/lib.rs:2209` | (hotkey, `NetUid`) | `AlphaBalance` | 261 |
-| `AlphaDividendsPerSubnet` | `pallets/subtensor/src/lib.rs:1865` | (`NetUid`, hotkey) | `AlphaBalance` | 233 |
-| `StakingHotkeys` | `pallets/subtensor/src/lib.rs:2117` | coldkey | `Vec<hotkey>` | 233 |
-| `Owner` | `pallets/subtensor/src/lib.rs:1771` | hotkey | coldkey | 233 |
-| `IdentitiesV2` | `pallets/subtensor/src/lib.rs:3301` | coldkey | `ChainIdentityOfV2` | 233 |
-| `SubnetIdentitiesV3` | `pallets/subtensor/src/lib.rs:3306` | `NetUid` | `SubnetIdentityOfV3` | 283 (290) |
-| `LastMechansimStepBlock` | `pallets/subtensor/src/lib.rs:2783` | `NetUid` | `u64` | 233 |
-| `BasketRate` | `pallets/subtensor/src/lib.rs:3674` | hotkey | `I96F32` | 441 |
-| `SwapRuntimeApi.current_alpha_price` | `pallets/swap/runtime-api/src/lib.rs:29` | `NetUid` argument | `u64` | 283 (290) |
-| `SwapRuntimeApi.current_alpha_price_all` | `pallets/swap/runtime-api/src/lib.rs:30` | none | `Vec<SubnetPrice>` | 391 |
-| `BetaBasketRuntimeApi.get_all_validator_baskets` | `pallets/subtensor/runtime-api/src/lib.rs:115` | none | `Vec<BasketSummary>` | 441 |
+| Item | Declared at | Key | Value | Decodes as | From spec |
+|---|---|---|---|---|---|
+| `NetworksAdded` | `pallets/subtensor/src/lib.rs:2675` | `Identity(NetUid)` | `bool` | `bool` | 233 |
+| `SubnetTAO` | `pallets/subtensor/src/lib.rs:2061` | `Identity(NetUid)` | `TaoBalance` (`u64`) | `u64` | 233 |
+| `SubnetAlphaIn` | `pallets/subtensor/src/lib.rs:2103` | `Identity(NetUid)` | `AlphaBalance` (`u64`) | `u64` | 233 |
+| `SubnetAlphaOut` | `pallets/subtensor/src/lib.rs:2108` | `Identity(NetUid)` | `AlphaBalance` (`u64`) | `u64` | 233 |
+| `SubnetTaoProvided`, `SubnetAlphaInProvided` | `pallets/subtensor/src/migrations/migrate_cleanup_swap_v3.rs:11,16` | `Identity(NetUid)` | `u64` | `u64` | 283 (290) to 422 |
+| `SubnetVolume` | `pallets/subtensor/src/lib.rs:2056` | `Identity(NetUid)` | `u128` | `u128` | 233 |
+| `SubnetMovingPrice` | `pallets/subtensor/src/lib.rs:2034` | `Identity(NetUid)` | `I96F32` | `i128` (the bits) | 233 |
+| `TaoWeight` | `pallets/subtensor/src/lib.rs:1742` | none | `u64`, default 971,718,665,099,567,868 | `u64` | 233 |
+| `Delegates` | `pallets/subtensor/src/lib.rs:1795` | `Blake2_128Concat(hotkey)` | `u16` through spec 424, `PerU16` from spec 432 (block 8,636,190). Default 11,796 | `u16` | 233 |
+| `TotalHotkeyAlpha` | `pallets/subtensor/src/lib.rs:2191` | (`Blake2_128Concat(hotkey)`, `Identity(NetUid)`) | `AlphaBalance` | `u64` | 233 |
+| `TotalHotkeyAlphaLastEpoch` | `pallets/subtensor/src/lib.rs:2209` | (`Blake2_128Concat(hotkey)`, `Identity(NetUid)`) | `AlphaBalance` | `u64` | 261 |
+| `AlphaDividendsPerSubnet` | `pallets/subtensor/src/lib.rs:1865` | (`Identity(NetUid)`, `Blake2_128Concat(hotkey)`) | `AlphaBalance` | `u64` | 233 |
+| `StakingHotkeys` | `pallets/subtensor/src/lib.rs:2117` | `Blake2_128Concat(coldkey)` | `Vec<hotkey>` | `Vec<Hotkey>` | 233 |
+| `Owner` | `pallets/subtensor/src/lib.rs:1771` | `Blake2_128Concat(hotkey)` | coldkey | `Coldkey` | 233 |
+| `IdentitiesV2` | `pallets/subtensor/src/lib.rs:3301` | `Blake2_128Concat(coldkey)` | `ChainIdentityOfV2` | `ChainIdentityV2`, 7 `Vec<u8>` fields | 233 |
+| `SubnetIdentitiesV3` | `pallets/subtensor/src/lib.rs:3306` | `Blake2_128Concat(NetUid)` | `SubnetIdentityOfV3` | `SubnetIdentityV3`, 8 `Vec<u8>` fields | 283 (290) |
+| `LastMechansimStepBlock` | `pallets/subtensor/src/lib.rs:2783` | `Identity(NetUid)` | `u64` | `u64` | 233 |
+| `BasketRate` | `pallets/subtensor/src/lib.rs:3674` | `Blake2_128Concat(hotkey)` | `I96F32` (`FixedI128 { bits: i128 }` in the registry) | `i128` (the bits) | 441 |
+| `SwapRuntimeApi.current_alpha_price` | `pallets/swap/runtime-api/src/lib.rs:29` | `NetUid` argument | `u64` | `u64` | 283 (290) |
+| `SwapRuntimeApi.current_alpha_price_all` | `pallets/swap/runtime-api/src/lib.rs:30` | none | `Vec<SubnetPrice>` | `Vec<{ netuid: u16, price: u64 }>` | 391 |
+| `BetaBasketRuntimeApi.get_all_validator_baskets` | `pallets/subtensor/runtime-api/src/lib.rs:115` | none | `Vec<BasketSummary>` | see [baskets](#read-baskets-from-the-runtime-api) | 441 |
 
-Spec 233 keyed the subnet maps by a plain `u16`. Later specs use the `NetUid` newtype. Both encode the same bytes, so the storage keys do not change.
+`Hotkey` and `Coldkey` are `struct Hotkey(pub [u8; 32])` and `struct Coldkey(pub [u8; 32])`. `NetUid` decodes as `u16`.
 
-`SubnetTaoProvided` and `SubnetAlphaInProvided` left the pallet at spec 423. The migration `migrate_cleanup_swap_v3` moved their values into `SubnetTAO` and `SubnetAlphaIn` (`pallets/subtensor/src/migrations/migrate_cleanup_swap_v3.rs:39-48`), so from spec 423 the reserves are the two plain items. Read the provided items only when the block's metadata declares them, and use 0 otherwise.
+Specs through 424 key the subnet maps by a plain `u16`. From spec 432 (block 8,636,190) the map keys and the runtime API arguments use the `NetUid` newtype. Both encode the same bytes, so the storage keys do not change.
+
+An item that the metadata in use does not declare is absent, and no decoder substitutes a default for it ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)). A row that requires an absent item is not written. A row for which the item is optional is written without it. Four items are optional. Without `SubnetTaoProvided` and `SubnetAlphaInProvided`, the reserve sum has no provided term. Without `SubnetEmaTaoFlow`, `ema_tao_flow_bits` is `NULL`. [Epochs](#detect-an-epoch-from-chain-state) covers `TotalHotkeyAlphaLastEpoch` before spec 261.
+
+A declared item with no stored value for a key reads as the default in its metadata. subxt's own `fetch` does this (`spikes/crates/chain-errors`, `missing-storage`). The product decodes raw bytes through `frame-decode`, so our code applies the default. Two items here have nonzero defaults, `TaoWeight` and `Delegates`, so take each default from the metadata and never assume 0.
+
+- For `Delegates`, `state_getStorage` answers null, and the metadata's default bytes decode to 11,796 (`spikes/crates/chain-decode`, `default-from-metadata`).
+- `TaoWeight` is first stored at 4,920,351, and 20 samples from there to the head hold no null. At 4,920,350 its read answers null, and spec 219, which executed that block, does not declare it, so the block reads it as absent. The raw null path with spec 233's metadata decodes the default in the table (`spikes/crates/chain-decode`, `taoweight-null`).
+
+`SubnetTaoProvided` and `SubnetAlphaInProvided` left the pallet at spec 423 (block 8,486,593). The migration `migrate_cleanup_swap_v3` moved their values into `SubnetTAO` and `SubnetAlphaIn` (`pallets/subtensor/src/migrations/migrate_cleanup_swap_v3.rs:39-48`), so from spec 423 the reserves are the two plain items. Their keys outlive them. After 423 the chain still holds 129 keys of each, all zero (`spikes/crates/chain-specs`, `P31-423`). A reader that iterates by prefix sees these stale keys, so read the provided items only by key, and only while the executing spec's metadata declares them.
+
+`SubnetIdentitiesV3` is declared from spec 290 (block 5,947,548) but holds 0 rows at 5,947,549, while `SubnetIdentitiesV2` holds 112. By spec 352, V3 holds 121 rows and V2 holds 2. Release 1 reads V3 at specs 475 to 490, where it holds the data (121 identities against 128 subnets at 9,490,000). A release 2 identity read at an older block must not pick V3 because it is declared.
 
 ### Read every netuid in one request
 
-The `prices` job computes the storage keys for every netuid and every item once. It reads all of them for a block with one `state_queryStorageAt` call. It refreshes the netuid set from `NetworksAdded` every 100 blocks, and on any block where the price API returns a netuid it does not know. With the price call and the block hash, that is about 2 to 3 node requests per block. That count is an estimate. [Ingestion](03-ingestion.md#estimate-the-backfill-time) uses it.
-
-`Timestamp.Now` goes in the same `state_queryStorageAt` call, so every job gets the block's time without a second request.
+The `prices` job computes the storage keys for every netuid and every item once. It reads all of them for a block with one `state_queryStorageAt` call. `Timestamp.Now` goes in the same call, so every job gets the block's time without a second request. The job refreshes the netuid set from `NetworksAdded` every 100 blocks, and on any block where the price API returns a netuid it does not know. With the price call and the block hash, that is 3 node requests and 54 KB per block at spec 490, and 2 requests at spec 234 (measured on 2026-11-12, `spikes/crates/chain-decode`, `out/cost.txt`). [Ingestion](03-ingestion.md#estimate-the-backfill-time) builds its estimate on that cost.
 
 ### Price comes from a weighted balancer pool
 
-The pool was a Uniswap-v3 style pool, with `AlphaSqrtPrice` holding the price as `U64F64`. Spec 423 replaced it with a weighted balancer (`pallets/swap/src/pallet/migrations/migrate_swapv3_to_balancer.rs:25`). The current price is `Balancer::calculate_price(x, y)` in `pallets/swap/src/pallet/balancer.rs:220`, from the subnet's alpha and TAO reserves.
+The pool was a Uniswap-v3 style pool, with `AlphaSqrtPrice` holding the price as `U64F64` (key `Twox64Concat(u16)`). Spec 423 (block 8,486,593) replaced it with a weighted balancer (`pallets/swap/src/pallet/migrations/migrate_swapv3_to_balancer.rs:25`). The current price is `Balancer::calculate_price(x, y)` in `pallets/swap/src/pallet/balancer.rs:220`, from the subnet's alpha and TAO reserves.
 
-The `prices` job uses the runtime API wherever it exists, and storage math only before it. Choose the era by what the block's metadata declares.
+The `prices` job uses the runtime API wherever it exists, and storage math only before it. A runtime API call at block `n` runs the code of `n`'s own state spec, so choose the era by what that spec's metadata declares.
 
-1. From spec 391, call `SwapRuntimeApi.current_alpha_price_all` once per block.
-2. For specs 290 to 390 (283 to 390 in git), call `SwapRuntimeApi.current_alpha_price(netuid)` once per subnet.
-3. Before spec 290, compute `SubnetTAO × 10^9 / SubnetAlphaIn`. The provided items do not exist yet, so their terms are 0.
+1. From spec 391 (block 7,782,857), call `SwapRuntimeApi.current_alpha_price_all` once per block.
+2. From spec 283 (290 on mainnet, block 5,947,548) to spec 390 (385 on mainnet), call `SwapRuntimeApi.current_alpha_price(netuid)` once per subnet.
+3. Before spec 283 (290 on mainnet), compute `SubnetTAO × 10^9 / SubnetAlphaIn` from storage, decoded with the executing spec's metadata. The provided items do not exist yet, so the reserves have no provided term.
 
-Both runtime API calls return rao per whole alpha, which is the unit `subnet_price.price` stores. The runtime computes the price in `current_price` (`pallets/swap/src/pallet/impls.rs:22-35`). It returns 10^9, a price of 1, for any subnet whose mechanism is not 1. It returns 0 for a mechanism-1 subnet whose alpha reserve is 0. The `prices` job does not read root (netuid 0), so root never gets a price row.
+At an upgrade block the new code runs over storage that the migration has not touched yet (`spikes/crates/chain-specs`, `P31`, `P31-290`, `P31-423`). At 5,947,548 and 8,486,593 the price API gives prices continuous with the next block. Storage math is different. At block 4,920,350, the dTAO items hold 0 keys while `NetworksAdded` holds 65, and spec 219, which executed that block, does not declare them. Read as zeros, they would give a zero price for every subnet. They are absent ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)), so `prices` writes no row for a subnet whose `SubnetTAO` or `SubnetAlphaIn` is not declared. Release 1 reads only one upgrade block in its `prices` window, 9,478,217 (spec 490), where the API path applies.
 
-The squid computed prices for specs 290 to 422 from `AlphaSqrtPrice` with integer math, while the runtime API uses its own fixed-point path. Our historic prices for those specs can therefore differ from the squid's stored values by 1 rao. `/pools` reads only the last 26 hours, so no compat value depends on them. The [decisions log](../decisions.md#d15-read-prices-from-the-runtime-api-not-from-v3-storage-math) records the trade.
+Both runtime API calls return rao per whole alpha, which is the unit `subnet_price.price` stores. The runtime computes the price in `current_price` (`pallets/swap/src/pallet/impls.rs:22-35`). It returns 10^9, a price of 1, for any subnet whose mechanism is not 1. It returns 0 for a mechanism-1 subnet whose alpha reserve is 0. `current_alpha_price_all` also returns root (netuid 0) at 10^9, one of its 129 entries at the measured head. The `prices` job drops that entry, so root never gets a price row.
 
-In release 2, `prices` keeps full history for candles. Specs 290 to 390 then cost one runtime API call per subnet per block. [Ingestion](03-ingestion.md#estimate-the-backfill-time) estimates that cost.
+The squid computed prices for specs 290 to 422 from `AlphaSqrtPrice` with integer math, while the runtime API uses its own fixed-point path. Our historic prices for those specs can therefore differ from the squid's stored values by 1 rao. `/pools` reads only the last 26 hours, so no compat value depends on them. Decision [D10](../decisions.md#d10-read-prices-from-the-runtime-api-not-from-v3-storage-math) records the trade.
+
+In release 2, `prices` keeps full history for candles. Specs 290 to 390 then cost one runtime API call per subnet per block, 128 calls at the measured block, and 131 calls per block with the 3 fixed calls. Over blocks 5,947,548 to 7,782,856 the 128 price calls alone come to (7,782,856 − 5,947,548 + 1) × 128 = 234,919,552 calls, at least about 23 days at the 120 calls a second cap ([D23](../decisions.md#d23-cap-the-call-rate-with-a-one-token-bucket-not-only-the-calls-in-flight)). [Ingestion](03-ingestion.md#estimate-the-backfill-time) uses that cost.
 
 ### Detect an epoch from chain state
 
 A block is an epoch block for a subnet when `LastMechansimStepBlock` for that subnet equals the block number. The name has a typo on chain. Use it as written. Recent runtimes can run an epoch early or defer it (`EpochTriggered` and `EpochDeferred` at `pallets/subtensor/src/macros/events.rs:682,692`), so the schedule must come from chain state, not from a formula on `Tempo`.
 
-At an epoch block, the `epochs` job reads `AlphaDividendsPerSubnet` for that netuid by key prefix and keeps the hotkeys with a nonzero dividend. It reads `TotalHotkeyAlphaLastEpoch(hotkey, netuid)` for each of them as `stake_at_epoch`. Before spec 261 that item does not exist, and `stake_at_epoch` is 0.
+At an epoch block, the `epochs` job reads `AlphaDividendsPerSubnet` for that netuid by key prefix and keeps the hotkeys with a nonzero dividend. It reads `TotalHotkeyAlphaLastEpoch(hotkey, netuid)` for each of them as `stake_at_epoch`. Before spec 261 (block 5,328,895) that item is not declared, and the decoder returns `None` for it. Release 1 never reads that era, so `stake_at_epoch` is `NOT NULL`, and release 2 chooses what to store for it.
+
+Measured on 2026-11-12, an epoch block holds about 50 dividend rows, and the job costs 3.0 calls and 23 KB per block at 9,490,000.
 
 ### Read baskets from the runtime API
 
 `get_all_validator_baskets` returns one `BasketSummary` per validator with an active basket (`pallets/subtensor/src/rpc_info/basket_info.rs:30-44`). The `baskets` job keeps `hotkey`, `nav_tao`, and `shares` (a `u64`). It reads `BasketRate(hotkey)` for each returned hotkey in the same block.
 
-The summary has two shapes. Mainnet specs 441 to 459 carry a `weights: Vec<(NetUid, u16)>` field between `redeemed_tao` and `holdings`. Mainnet spec 460 removed it. The reference squid dates the removal to 460 from mainnet blocks (`src/basket-runtime-api.ts:17-18,32`), while git puts it in the spec 461 commit (`7c9d45ebd`). Decode each shape with its own struct, chosen by the metadata's return type.
+The summary has two shapes. Specs 441 to 459 carry a `weights: Vec<(NetUid, u16)>` field between `redeemed_tao` and `holdings`. The spec 461 commit (`7c9d45ebd`) removed it. Mainnet ran 459 and then 464 (block 9,088,597), so 464 is the first mainnet spec without the field.
+
+One struct without `weights` decodes both shapes, because `DecodeAsType` matches fields by name and skips a field our struct does not have. It decoded specs 441 to 490, including 21 nonempty `weights` at block 9,088,596. At 448 and 459 it gave every field equal to the struct with `weights`, for 179 and 187 baskets (`spikes/crates/chain-decode`, `basket-one-struct`).
+
+```rust
+#[derive(DecodeAsType)]
+struct BasketSummary { hotkey: Hotkey, nav_tao: u64, spot_nav_tao: u64, shares: u64, deposited_tao: u64, redeemed_tao: u64, holdings: Vec<BasketHolding> }
+
+#[derive(DecodeAsType)]
+struct BasketHolding { netuid: u16, alpha: u64, spot_tao: u64, realizable_tao: u64 }
+```
+
+Release 1 reads only the shape without `weights`. One `get_all_validator_baskets` call took 8.7 to 33.5 s near the head on 2026-11-12, depending on node load, and a snapshot of about 190 baskets cost 3 calls and about 444 KB (`spikes/crates/chain-decode`, `basket-call-time`, `baskets-cost`). So `chain.rpc_timeout` is 90 s ([D23](../decisions.md#d23-cap-the-call-rate-with-a-one-token-bucket-not-only-the-calls-in-flight)).
 
 The squid takes baskets every 500 blocks. Keep that cadence, because the root APR formula and its 10-snapshot rule were tuned on it.
 
@@ -122,48 +151,97 @@ It calls `SubtensorRuntimeApi.get_all_dynamic_info` (`pallets/subtensor/runtime-
 - `SubnetVolume` (`pallets/subtensor/src/lib.rs:2056`).
 - From the swap pallet, `FeeRate` (`pallets/swap/src/pallet/mod.rs:97`) and, from spec 423, `SwapBalancer` (`pallets/swap/src/pallet/mod.rs:110`).
 
-Read each item only when the block's metadata declares it.
+Read each storage item only when the executing spec's metadata declares it, and call the runtime API only when the block's state spec declares it.
 
-## Decode each block with its own metadata
+## Decode each block with the metadata of the runtime that ran it
 
 Each runtime version has its own metadata. The metadata holds a type registry that says how every event, storage value, and runtime API result is encoded. A decoder built for spec 490 reads spec 233 bytes wrong, or fails.
 
-A block's events are encoded by the runtime that executed the block. That is the runtime in the parent's state. The block that applies a runtime upgrade still runs the old runtime, and its post-state holds the new one. Two rules follow.
+The upgrade block `u` of a spec still runs the old runtime, and its post-state reports the new one. Each block therefore has two specs, and `SpecAt { executed_by, state }` keeps both. `BlockRef` carries it. `executed_by` is the state spec of the parent, and `state` is the spec the block's own state reports. They differ only at an upgrade block. Two rules follow ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)).
 
-- **Decode events with the parent's spec.** Release 2's `events` job fetches metadata at the parent hash.
-- **Read state with the block's own spec.** A storage value or runtime API result at block `n` is encoded by the runtime in block `n`'s post-state. Every release 1 job uses this rule.
+- **Decode storage and events with the executing spec.** The storage and events of block `n` decode with the metadata of `executed_by`. At `u` the storage is still in the old layout. `System.LastRuntimeUpgrade` still names the old spec, and items the new spec adds have 0 keys until `u + 1`. Key counts show this at 4,920,350, 5,947,548 and 8,486,593 (`spikes/crates/chain-specs`, `P31`, `P31-290`, `P31-423`). The parent's metadata decodes the events of all 106 upgrade blocks with no bytes left over, and the block's own metadata fails at 13 of them (`spikes/crates/chain-specs`, `D-scan`).
+- **Call runtime APIs with the state spec.** A runtime API call at `n` runs the node's code for `n`'s state, which is the new code at `u`. Encode its arguments and decode its result with the metadata of `state`.
+
+Decision [D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec) lists the checks behind both rules. They cover every item release 1 reads at the 10 upgrade blocks of its window, sampled maps at 7 older upgrade blocks, and the 35 cases of the decode table.
+
+### Fetch metadata through the runtime API
+
+Fetch metadata with `state_call("Metadata_metadata_at_version", SCALE(v: u32), hash)`. The result decodes as `Option<Vec<u8>>` holding `RuntimeMetadataPrefixed`. `v` is the highest value that `Metadata_metadata_versions` returns at the same hash, after dropping `4294967295`. That is 16 for specs 326 to 490. subxt chooses the same way. V16 decodes the same cases as V15 with identical output, and gives the same shapes for the 48 recorded specs from 326 to 490 (`spikes/crates/chain-decode`, `metadata-v16`).
+
+For the executing spec, call at the parent hash. For the state spec, call at the block's own hash ([D7](../decisions.md#d7-fetch-metadata-with-metadata_metadata_at_version)). `BlockRef` holds no parent hash, so on a cache miss `Chain::metadata` first calls `source.block_ref(n − 1)` ([D34](../decisions.md#d34-keep-one-fixture-per-test-case-and-record-it-by-running-the-jobs-own-read)).
+
+One fetch took 0.9 to 8.8 s per spec for 400 to 445 KB, measured for specs 475, 482 and 490 (`spikes/crates/chain-errors`, `metadata-fetch-time`). A metadata file is 0.2 to 0.45 MB.
+
+Do not use `state_getMetadata`. It returns V14, which lists no runtime APIs, so the metadata could not say whether an API exists (`spikes/crates/chain-specs`, `P4`). `Metadata_metadata_at_version(15)` lists 19 runtime APIs at spec 233 and 26 at spec 490. The versions on offer by era:
+
+| Mainnet specs | `Metadata_metadata_versions` |
+|---|---|
+| 219 to 277 | `[14, 15]` |
+| 290 to 323 | `[14, 15, 4294967295]` |
+| 326 to 490 | `[14, 15, 16]` |
+
+### Find each spec's upgrade block by bisection
+
+The `runtime_version` table maps each spec to `first_block`, its upgrade block. The spec executes from `first_block + 1`. So `executed_by(n)` is the spec of the last row with `first_block < n`, and `state(n)` is the spec of the last row with `first_block <= n` ([D8](../decisions.md#d8-find-the-spec-table-by-bisection-over-code-and-persist-only-the-specs-a-job-window-touches)).
+
+The table starts with a base row: spec 219 at 4,920,349, the spec in force at the start block. It makes `executed_by(4920350)` answer 219. With no row below 4,920,350, `OfflineClient::at_block(4920350)` fails with `SpecVersionNotFound` (`spikes/crates/chain-errors`, `metadata-missing`). 219's true upgrade block is earlier and is not needed.
+
+The table is found by bisection, not learned when a reader first meets a spec. A reader that skips blocks meets a spec late. One that reads every 100th block first meets 490 at 9,478,300, but 490's upgrade block is 9,478,217 (`spikes/crates/chain-specs`, `P5`).
+
+1. Bisect over `state_getStorageHash(":code")`. A change of the hash between two blocks means an upgrade between them.
+2. Confirm each boundary with `state_getRuntimeVersion` at `n − 1` and `n`.
+3. At each range end and at each new head, one `:code` hash check rules out a new spec. Upgrades can come 2 blocks apart (4,920,350 and 4,920,352), so nothing coarser does (`spikes/crates/chain-specs`, `P30`).
+
+The whole bisection from dTAO to 2026-11-12 took 3,222 calls and about 1 minute on the keyed archive node, plus about 11 minutes of version checks. It found 106 specs, 233 to 490. On a warm node one `:code` hash took 0.28 to 0.35 s and one runtime version 0.28 to 1.46 s. A bisection over `state_getRuntimeVersion` at 6 concurrent calls found no boundary in 23 minutes (`spikes/crates/chain-specs`, `bisect-method`).
+
+`bt-indexer chain specs --from 4920349` writes the table to `fixtures/specs.csv`, the product's one committed spec file. Its rows are the 219 base row and the rows of `spikes/data/specs.csv`. The product seeds the table from `fixtures/specs.csv` and bisects only past its last row.
+
+`chain` may not depend on `store`, so a read that finds a new spec returns a `#[must_use] NewRuntime`, and `ingest` stores it (`spikes/crates/chain-specs`, `P6`, `P7`). The table lives in memory in M0 and is persisted in `runtime_version` from M1. The in-memory table holds every row of `fixtures/specs.csv`. `runtime_version` gets a row, with its metadata, only for each spec that a job window touches, the first time a job needs that spec ([D8](../decisions.md#d8-find-the-spec-table-by-bisection-over-code-and-persist-only-the-specs-a-job-window-touches)). Each spec's metadata loads from the table into the in-memory cache on first use.
 
 ### Give subxt the spec and metadata
 
-subxt's defaults break the first rule. `OnlineClient` calls `Core_version` and fetches metadata against the block's own hash, unless the `Config` supplies both. Our `Config` implements the two hooks from the `runtime_version` table (`subxt-0.50.3/src/config.rs:113,125`).
+Storage values and runtime API results decode from raw bytes through `frame-decode`, with a `subxt::Metadata` that we pick by the rules above. subxt's `StorageValue::new` is `pub(crate)`, so subxt cannot decode storage bytes we fetched ourselves (`spikes/crates/chain-decode`, `P19`). One subxt `Config` hook cannot serve both rules either. subxt asks it for one spec per block number and uses that spec's metadata for both events and storage. At 5,228,683 the hook answers 252 while the state reports 257 (`spikes/crates/chain-specs`, `P1`).
+
+The hook therefore serves events only, in release 2, and answers `executed_by`. It implements all 7 associated types. `TransactionExtensions` is `SubstrateExtrinsicParams<Self>`, and the others delegate to `SubstrateConfig`. Its maps sit behind `Arc<RwLock<_>>` because `set_metadata_for_spec_version` takes `&self`.
+
+Events decode only through `OfflineClient`, with the executing spec's metadata registered through `set_metadata_for_spec_version` before `at_block`. An `OnlineClient` fetches missing metadata itself, at the block's own hash, and files it under the hook's spec (`subxt-0.50.3/src/client/online_client.rs:397-403,604-617`). At an upgrade block that stores the new spec's metadata under the old spec's number, and the old spec's ordinary blocks then fail to decode (`spikes/crates/chain-specs`, `online-metadata-miss`).
 
 ```rust
+#[derive(Clone, Debug, Default)]
+pub struct Subtensor {
+    versions: Arc<RwLock<BTreeMap<u64, u32>>>,
+    metadata: Arc<RwLock<HashMap<u32, ArcMetadata>>>,
+}
+
 impl Config for Subtensor {
-	fn spec_and_transaction_version_for_block_number(&self, n: u64) -> Option<(u32, u32)> {
-		self.versions.at_block(n)
-	}
+    type AccountId = <SubstrateConfig as Config>::AccountId;
+    type Address = <SubstrateConfig as Config>::Address;
+    type Signature = <SubstrateConfig as Config>::Signature;
+    type Hasher = <SubstrateConfig as Config>::Hasher;
+    type Header = <SubstrateConfig as Config>::Header;
+    type TransactionExtensions = SubstrateExtrinsicParams<Self>;
+    type AssetId = <SubstrateConfig as Config>::AssetId;
 
-	fn metadata_for_spec_version(&self, spec: u32) -> Option<ArcMetadata> {
-		self.metadata.get(spec)
-	}
+    fn spec_and_transaction_version_for_block_number(&self, n: u64) -> Option<(u32, u32)> {
+        // Keyed by first_block. The spec that executed n is the last one upgraded before n.
+        self.versions.read().unwrap().range(..n).next_back().map(|(_, s)| (*s, 1))
+    }
 
-	fn set_metadata_for_spec_version(&self, spec: u32, metadata: ArcMetadata) {
-		self.metadata.insert(spec, metadata);
-	}
+    fn metadata_for_spec_version(&self, spec: u32) -> Option<ArcMetadata> {
+        self.metadata.read().unwrap().get(&spec).cloned()
+    }
+
+    fn set_metadata_for_spec_version(&self, spec: u32, metadata: ArcMetadata) {
+        self.metadata.write().unwrap().insert(spec, metadata);
+    }
 }
 ```
 
-`versions.at_block(n)` answers from the `first_block` of each row in `runtime_version`. It returns the spec of the runtime that executed block `n`, which is the spec in the parent's state. The `chain` crate fills the table as it meets new specs.
-
-1. For a block `n` beyond the known ranges, call `state_getRuntimeVersion` at the parent hash.
-2. If the spec is new, fetch its metadata with `state_getMetadata` at the same parent hash. Store the spec, `first_block = n`, and the raw bytes in `runtime_version` in one transaction.
-3. Load each spec's metadata from the table into the in-memory cache on first use.
-
-A state read at block `n` uses the spec of block `n + 1`'s parent, which is block `n` itself. The `chain` crate looks that up in the same table.
+At upgrade block 5,228,683, executed by 252 with state 257, this hook decodes the block's 4 `StakeAdded` events with 252's metadata through `OfflineClient`. With 257's metadata the same bytes fail (`spikes/crates/chain-specs`, `subtensor-config`).
 
 ### Decode into era structs
 
-Decode each event's fields into a struct that derives `scale_decode::DecodeAsType`. `DecodeAsType` matches our struct against the type in that spec's registry. It does not assume one fixed layout. Each struct holds one era's shape, and a `From` conversion turns it into the domain type.
+Decode each event's fields into a struct that derives `scale_decode::DecodeAsType`. `DecodeAsType` matches our struct against the type in that spec's registry. It does not assume one fixed layout. Each event struct holds one era's shape, and a `From` conversion turns it into the domain type. The event decoders call subxt 0.50.3's `decode_fields_unchecked_as::<T>()` ([D22](../decisions.md#d22-classify-chain-errors-by-what-the-node-sends-and-bound-the-clients-waits-with-our-own-timeouts)). The match is on the executing spec, never on the block's state spec.
 
 ```rust
 #[derive(DecodeAsType)]
@@ -175,38 +253,42 @@ struct StakeAddedV257(Coldkey, Hotkey, u64, u64, u16, u64);
 #[derive(DecodeAsType)]
 struct BasketClaimedV441 { hotkey: Hotkey, coldkey: Coldkey, tao: u64 }
 
-fn stake_added(raw: &RawEvent, spec: SpecVersion) -> Result<StakeAdded, DecodeError> {
-	match spec.0 {
-		..257 => raw.decode_fields::<StakeAddedV233>().map(StakeAdded::from),
-		_ => raw.decode_fields::<StakeAddedV257>().map(StakeAdded::from),
-	}
+fn stake_added(raw: &RawEvent, executed_by: SpecVersion) -> Result<StakeAdded, DecodeError> {
+    match executed_by.0 {
+        ..257 => raw.decode_fields_unchecked_as::<StakeAddedV233>().map(StakeAdded::from),
+        _ => raw.decode_fields_unchecked_as::<StakeAddedV257>().map(StakeAdded::from),
+    }
 }
 ```
 
-Era structs use `Coldkey` and `Hotkey`, never a bare account type. Tuple stake events put the coldkey first (`pallets/subtensor/src/macros/events.rs:17-24`), while basket events are structs that put the hotkey first (`pallets/subtensor/src/macros/events.rs:514-521`). With bare accounts, a `From` that swaps them compiles. With the newtypes, it fails with `E0308`.
+Era structs use `Coldkey` and `Hotkey`, never a bare account type. Tuple stake events put the coldkey first (`pallets/subtensor/src/macros/events.rs:17-24`), while basket events are structs that put the hotkey first (`pallets/subtensor/src/macros/events.rs:514-521`). With bare accounts, a `From` that swaps them compiles. With the newtypes, the compiler rejects it.
 
-`Coldkey` and `Hotkey` wrap `[u8; 32]` directly and derive `DecodeAsType`. The chain's `AccountId32` is a composite with one `[u8; 32]` field, so the depths match. A probe showed that the derive does not look through an extra layer. `Coldkey(subxt::utils::AccountId32)` against the chain's `AccountId32` fails with `Unexpected(Array)`.
+`Coldkey` and `Hotkey` wrap `[u8; 32]` directly and derive `DecodeAsType`. The chain's `AccountId32` is a composite with one `[u8; 32]` field, so the depths match. Keep that one layer.
 
-Amounts and netuids decode as plain `u64` and `u16`. `TaoBalance`, `AlphaBalance`, and `NetUid` are newtypes on chain from some spec onward, and a plain integer decodes from them. A derived `NetUid(u16)` does not decode from the plain `u16` that spec 233 uses, so the `From` conversion wraps the integers in our newtypes instead.
+Amounts and netuids decode as plain `u64` and `u16`. `TaoBalance`, `AlphaBalance`, and `NetUid` are newtypes in the type registry from spec 432 (block 8,636,190), with the same values, and a plain integer decodes from them in every case of the decode table. The `From` conversion wraps the integers in our newtypes, so the decode structs need only the plain integers in every era.
 
 The match on `spec` lists every shape change in one place. The reference squid instead generated types for about 60 runtime versions and checked each with `.v233.is()` calls. Our approach needs one struct per real shape change, which is two for `StakeAdded`.
 
-The `runtime_version` table stores the raw metadata bytes for every spec we have seen. A decode bug fix then re-decodes old blocks without fetching metadata from the node again.
+The `runtime_version` table stores the raw metadata bytes for every spec a job has needed. A decode bug fix then re-decodes old blocks without fetching metadata from the node again.
 
 ### Find every shape change before writing a decoder
 
-Do not rely on release notes to find shape changes. Build a small tool, `bt-indexer metadata diff`. It loads the metadata for every spec from 233 to the current one and prints each spec where an item we read or decode changed type. Run it whenever the chain upgrades, and add a struct for each change it reports. A decoder test then decodes a recorded block from each era. [Quality](09-quality.md#test-the-decoders-against-recorded-blocks) describes those tests.
+Do not rely on release notes to find shape changes. Build a small tool, `bt-indexer metadata diff`. It loads the metadata for every spec from 219, which executed block 4,920,350, to the current one and prints each spec where an item we read or decode changed type. Run it whenever the chain upgrades, and add a struct for each change it reports. A decoder test then decodes a recorded block from each era. [Quality](09-quality.md#test-the-decoders-against-recorded-blocks) describes those tests.
 
-Known shape changes since spec 233:
+Known shape changes since spec 233. Each block number is the mainnet upgrade block from `spikes/data/specs.csv`.
 
-- `StakeAdded` and `StakeRemoved` gained the fee field at spec 257.
-- `ColdkeySwapped` dropped its `swap_cost` field at spec 385.
-- `RootClaimed` gained a `tao` field at spec 441.
-- `Delegates` changed from `u16` to `PerU16`, which encodes the same.
-- The swap V3 storage appeared at spec 283 (290 on mainnet) and left at spec 423, when the pool changed to a balancer.
-- `TotalHotkeyAlphaLastEpoch` appeared at spec 261, and `SubnetIdentitiesV3` at spec 283 (290 on mainnet).
-- Basket storage and the basket runtime API appeared at spec 441. Spec 460 removed `weights` from `BasketSummary`.
-- `SwapRuntimeApi.current_alpha_price_all` appeared at spec 391.
+- `StakeAdded` and `StakeRemoved` gained the fee field at spec 257 (block 5,228,683).
+- `TotalHotkeyAlphaLastEpoch` appeared at spec 261 (block 5,328,895).
+- The swap V3 storage, `SwapRuntimeApi.current_alpha_price`, the two provided items, and `SubnetIdentitiesV3` appeared at spec 283 (290 on mainnet, block 5,947,548).
+- `SubnetIdentities`, `SubnetIdentitiesV2`, and the coldkey `Identities` left at spec 361 (block 7,063,679).
+- `ColdkeySwapped` dropped its `swap_cost` field at spec 385 (block 7,782,670).
+- `SwapRuntimeApi.current_alpha_price_all` appeared at spec 391 (block 7,782,857).
+- The swap V3 storage and the provided items left at spec 423 (block 8,486,593), when the pool changed to a balancer.
+- `Delegates` changed from `u16` to `PerU16` at spec 432 (block 8,636,190), which encodes the same. Map keys, runtime API arguments, and event amounts and netuids became newtypes in the registry at the same spec, with the same bytes.
+- Basket storage and the basket runtime API appeared at spec 441 (block 8,765,683). `RootClaimed` gained a `tao` field at the same spec.
+- `BasketSummary` lost `weights` at spec 461 (464 on mainnet, block 9,088,597).
+
+At 13 upgrade blocks the parent's metadata and the block's own metadata disagree on the events. They are the upgrade blocks of specs 233, 252, 257, 273, 290, 320, 334, 365, 372, 385, 411, 423, and 441 (`spikes/crates/chain-specs`, `D-scan`). `bt-indexer metadata diff` names the events that changed at each, before release 2 writes a decoder for them.
 
 ### Handle an unknown event
 
@@ -214,7 +296,7 @@ The `events` job skips an event it does not index by pallet and variant name bef
 
 ## Index these events in release 2
 
-Release 2 adds the `events` job. Indexing starts at block 4,920,350, which runs spec 233. The tables list each event, where subtensor defines it, and the specs where its shape changed. Event lines refer to `pallets/subtensor/src/macros/events.rs`.
+Release 2 adds the `events` job. Indexing starts at block 4,920,350. That is the upgrade block to spec 233, and spec 219 executed it, so its events decode with 219's metadata (`spikes/crates/chain-specs`, `P2`). The tables list each event, where subtensor defines it, and the specs where its shape changed. Event lines refer to `pallets/subtensor/src/macros/events.rs`.
 
 ### SubtensorModule (pallet index 7)
 
@@ -229,7 +311,7 @@ Release 2 adds the `events` job. Indexing starts at block 4,920,350, which runs 
 | `AlphaBurned` (line 340) | coldkey, hotkey, `AlphaBalance`, `NetUid` | from 257 | Removes alpha from a position |
 | `HotkeySwapped` (line 171) | struct of coldkey, old hotkey, new hotkey | none | Reconciles every coldkey with a position on either hotkey |
 | `HotkeySwappedOnSubnet` (line 373) | struct of coldkey, old hotkey, new hotkey, netuid | from 275 (276 on mainnet) | The same, on that netuid only |
-| `ColdkeySwapped` (line 196) | struct of old coldkey, new coldkey | 233 to 384 add `swap_cost: u64` | Reconciles both coldkeys |
+| `ColdkeySwapped` (line 196) | struct of old coldkey, new coldkey | 233 to 384 (377 on mainnet) add `swap_cost: u64` | Reconciles both coldkeys |
 | `RootClaimed` (line 472) | struct of coldkey, `tao` | 334 to 440 have only `coldkey`. 441 adds `tao` | Reconciles the coldkey |
 | `NetworkAdded` (line 13) | `NetUid`, mechanism `u16` | none | Opens a `subnet` row |
 | `NetworkRemoved` (line 15) | `NetUid` | none | Marks the subnet removed, and reconciles its holders |
@@ -300,7 +382,7 @@ From spec 423, `pallets/swap` declares only `FeeRateSet`. Before that, the liqui
 
 `swap_coldkey.rs` and `claim_root.rs` emit no `StakeAdded` or `StakeRemoved`. A coldkey swap moves every position to the new coldkey. A root claim adds stake with `increase_stake_for_hotkey_and_coldkey_on_subnet` (`pallets/subtensor/src/staking/claim_root.rs:344`) and emits only `RootClaimed`. The folder reconciles the coldkeys these events name. The new coldkey of a swap has no position row yet, and the reconcile creates it.
 
-Emissions also grow stake with no event. Every coldkey that gains stake by any path is added to `StakingHotkeys` (`pallets/subtensor/src/staking/stake_utils.rs:830-841`). The daily reconcile therefore takes its coldkeys from the keys of `StakingHotkeys`, not from our `position` table.
+Emissions also grow stake with no event. Every coldkey that gains stake by any path is added to `StakingHotkeys` (`pallets/subtensor/src/staking/stake_utils.rs:830-841`). The daily reconcile therefore takes its coldkeys from the keys of `StakingHotkeys`. That set includes coldkeys that hold only emissions, which have no `position` row.
 
 ### Removing a subnet takes two steps
 
@@ -324,10 +406,9 @@ The folder reconciles the subnet's holders at both events. Whatever the chain re
 
 Decode each of these as its raw integer and convert it with the `fixed` crate. Never pass them through `f64` in the write path. `f64` loses precision above 2^53, and the `I96F32` values pass that limit.
 
-### Other details
+### Basket holdings count toward TotalHotkeyAlpha
 
-- Accounts use the SS58 prefix 42.
-- Basket holdings count toward `TotalHotkeyAlpha`. Release 1 serves `TotalHotkeyAlpha` as the squid does and does not subtract them.
+`TotalHotkeyAlpha` includes the alpha that baskets hold. Release 1 serves it as the squid does and does not subtract the holdings.
 
 ## Port a few domain types from subtensor
 
@@ -354,4 +435,4 @@ pub struct Hotkey([u8; 32]);
 pub struct Coldkey([u8; 32]);
 ```
 
-`Hotkey` and `Coldkey` are separate types, so a function that takes a hotkey rejects a coldkey at compile time.
+`Hotkey` and `Coldkey` are separate types, so a function that takes a hotkey rejects a coldkey at compile time. Both print with the SS58 prefix 42.

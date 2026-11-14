@@ -2,6 +2,8 @@
 
 The indexer uses one PostgreSQL 17 database with the TimescaleDB extension. This document explains which kind of table holds which kind of data, gives the schema for both releases, and estimates the size.
 
+The schema below runs on TimescaleDB 2.31.0 on PostgreSQL 17.11, from the image tag `timescale/timescaledb:2.31.0-pg17`, with sqlx 0.8.6, bigdecimal 0.4.11 and chrono 0.4.45 (`spikes/crates/store`, `ddl-applies`, `sizes`). Every environment pins that image by digest, as `timescale/timescaledb@sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538` ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests)).
+
 ## Match the table kind to the data
 
 The data falls into four kinds. Each kind gets the storage that fits how the API reads it.
@@ -19,9 +21,9 @@ A continuous aggregate is a materialized view that TimescaleDB refreshes on a sc
 
 ### Why one database
 
-TimescaleDB is still PostgreSQL. `sqlx` checks every query against it at compile time, one backup covers all the data, and one transaction can write a fact and the checkpoint that covers it. A column store such as ClickHouse would scan faster, but it adds a second system to run, back up, and keep consistent with PostgreSQL. At the size estimated below, PostgreSQL with compression is enough. The [decisions log](../decisions.md#d4-one-postgresql-database-with-timescaledb) records the trade.
+TimescaleDB is still PostgreSQL. `sqlx` checks every query against it at compile time, one backup covers all the data, and one transaction can write a fact and the checkpoint that covers it. A column store such as ClickHouse would scan faster, but it adds a second system to run, back up, and keep consistent with PostgreSQL. At the size estimated below, PostgreSQL with compression is enough. The [decisions log](../decisions.md#d15-one-postgresql-database-with-timescaledb) records the trade.
 
-Release 1 keeps no response cache and runs no Redis. The [decisions log](../decisions.md#d14-shed-load-and-do-not-rate-limit-or-cache-in-process) explains why.
+Release 1 keeps no response cache. The [decisions log](../decisions.md#d25-shed-load-on-the-compat-routes-and-do-not-rate-limit-or-cache-in-process) explains why.
 
 ## Store values in exact types
 
@@ -29,7 +31,7 @@ Release 1 keeps no response cache and runs no Redis. The [decisions log](../deci
 |---|---|---|
 | Rao and alpha amounts that fit `u64` | `BIGINT` with `CHECK (x >= 0)` | `u64` on chain. Total TAO supply is 2.1 × 10^16 rao, below the `i64` limit of 9.2 × 10^18. The store converts with `i64::try_from` and returns `StoreError::Overflow` on failure. It never uses `as` |
 | Signed amounts, such as drift and flow | `BIGINT` | |
-| `u128` values and fixed-point raw bits (`I96F32`, `I64F64`) | `NUMERIC(39,0)` | The raw integer. The API converts it. sqlx needs its `bigdecimal` feature for this type |
+| `u128` values and fixed-point raw bits (`I96F32`, `I64F64`) | `NUMERIC(39,0)` | The raw integer. The API converts it. The writer needs sqlx's `bigdecimal` feature for this type. The API can read it as `col::text` and `str::parse::<u128>` without that feature |
 | Prices | `BIGINT` | Rao per whole alpha |
 | Accounts | `BYTEA` with `CHECK (length(x) = 32)` | The raw public key. The API renders SS58 with prefix 42 |
 | Hashes | `BYTEA` with `CHECK (length(x) = 32)` | |
@@ -42,12 +44,33 @@ Accounts are stored as bytes, not SS58 strings. A 32-byte key takes less space a
 
 No column holds a floating-point amount. The API computes ratios and APYs in `float8` at query time and never writes them back.
 
+### Map each column to one Rust type
+
+These bindings round-trip through `sqlx::query!` for every release 1 table, nulls and signed `NUMERIC` included (`spikes/crates/store`, `unnest-types`).
+
+| Column type | Rust type | Conversion |
+|---|---|---|
+| `TIMESTAMPTZ` | `chrono::DateTime<Utc>` | Array parameter `$n::timestamptz[]` |
+| `INTEGER` | `i32` | Block numbers with `i32::try_from(u32)`. Netuid and take with `i32::from(u16)` |
+| `BIGINT` | `i64` | `i64::try_from(u64)`, with `StoreError::Overflow` on failure |
+| `NUMERIC(39,0)` | `bigdecimal::BigDecimal` | Write with `BigDecimal::from(u128)` or `BigDecimal::from(i128)`. Read with `is_integer()`, then `to_u128()` or `to_i128()` |
+| `BYTEA` | `Vec<u8>` | `Vec<[u8; 32]>` also binds to `bytea[]` |
+| `REAL` | `f32` | Only `checkpoint.blocks_per_sec` |
+| Enum type (release 2) | Rust enum | `#[derive(sqlx::Type)] #[sqlx(type_name = "staking_kind", rename_all = "snake_case")]` |
+
+`NUMERIC(39,0)` holds 0, 1, `u64::MAX` and `u128::MAX`. A value of 10^39 fails with SQLSTATE 22003. A fraction such as 2.5 is stored as 3 with no error, so the store binds only values built from an integer type, never from a parsed decimal.
+
+All release 1 queries use `sqlx::query!` and friends, checked against a committed `.sqlx/` cache. `cargo sqlx prepare --check` and a build with `SQLX_OFFLINE=true` work from that cache, and the build fails without it (`spikes/crates/store`, `sqlx-offline`).
+
 ### Write batches with UNNEST
 
-Writers insert a batch with `INSERT ... SELECT * FROM UNNEST($1::bytea[], $2::integer[], ...)`. `query!` infers each array parameter as non-null, so a nullable column needs an `as _` override, which turns off its compile-time check. Two columns of the same type, such as `coldkey` and `hotkey`, can also be swapped without a compile error. Two rules close both gaps.
+Writers insert a batch with `INSERT ... SELECT * FROM UNNEST($1::bytea[], $2::integer[], ...)`. `query!` infers each array parameter as non-null, so a nullable column needs `&v as &[Option<T>]` or an `as _` override, or the build fails. `as _` turns off that column's compile-time check. Two columns of the same type, such as `coldkey` and `hotkey`, can also be swapped without a compile error. `UNNEST` also accepts arrays of unequal length, and a `NULL` reaches the column. A `NOT NULL` column then fails with 23502, but a nullable column takes the `NULL` silently (`spikes/crates/store`, `unnest-ragged`). Three rules close these gaps.
 
 - One function per table builds every column array of a batch from the row structs, such as `fn columns(rows: &[StakingActionRow]) -> StakingActionCols`. No other code builds the arrays.
+- That function asserts that every array it returns has the same length.
 - Each batch table has a round-trip test. It writes rows with a distinct value in every column, nulls included, reads them back, and compares them.
+
+In a test of 500 blocks × 129 rows (64,500 rows), one `UNNEST` plus the checkpoint update committed in 1.21 to 1.32 s in local Docker with a debug build. In the same test, one block of 129 rows took about 4.9 ms. Both were measured on 2026-11-12.
 
 ## Release 1 schema
 
@@ -55,63 +78,67 @@ The migrations in `crates/store/migrations/` are the source of truth. This secti
 
 ### Pipeline state
 
+Migration `0001` starts by creating the extension. A database made from `template0` has no TimescaleDB, and every later `create_hypertable` call would fail. The compose image hides this, because it installs the extension in its default database (`spikes/crates/store`, `ddl-applies`).
+
 ```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
 CREATE TABLE runtime_version (
-	spec_version  INTEGER PRIMARY KEY,
-	first_block   INTEGER NOT NULL UNIQUE,
-	metadata      BYTEA NOT NULL,
-	fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    spec_version  INTEGER PRIMARY KEY,
+    first_block   INTEGER NOT NULL UNIQUE,
+    metadata      BYTEA NOT NULL,
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE checkpoint (
-	worker          TEXT PRIMARY KEY,
-	mode            TEXT NOT NULL CHECK (mode IN ('backfill', 'live')),
-	start_block     INTEGER NOT NULL,
-	last_block      INTEGER NOT NULL,
-	last_block_ts   TIMESTAMPTZ NOT NULL,
-	target_block    INTEGER NOT NULL,
-	blocks_per_sec  REAL NOT NULL,
-	updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-	CHECK (start_block <= last_block + 1)
+    worker          TEXT PRIMARY KEY,
+    mode            TEXT NOT NULL CHECK (mode IN ('backfill', 'live')),
+    start_block     INTEGER NOT NULL,
+    last_block      INTEGER NOT NULL,
+    last_block_ts   TIMESTAMPTZ NOT NULL,
+    target_block    INTEGER NOT NULL,
+    blocks_per_sec  REAL NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (start_block <= last_block + 1)
 );
 
 CREATE TABLE chain_head (
-	id               INTEGER PRIMARY KEY CHECK (id = 1),
-	finalized_block  INTEGER NOT NULL,
-	finalized_ts     TIMESTAMPTZ NOT NULL,
-	updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    finalized_block  INTEGER NOT NULL,
+    finalized_ts     TIMESTAMPTZ NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-`runtime_version.first_block` is the first block that the spec executed. [Chain data](02-chain-data.md#give-subxt-the-spec-and-metadata) explains how the decoder uses it.
+`runtime_version.first_block` is the upgrade block, the first block whose state reports the spec. The spec executes from `first_block + 1` ([D8](../decisions.md#d8-find-the-spec-table-by-bisection-over-code-and-persist-only-the-specs-a-job-window-touches)). [Chain data](02-chain-data.md#give-subxt-the-spec-and-metadata) explains how the decoder uses it. The insert names its conflict column, `ON CONFLICT (spec_version) DO NOTHING`. A bare `ON CONFLICT DO NOTHING` also swallows a second spec at an existing `first_block` without an error (`spikes/crates/store`, `runtime-insert`).
 
-A job creates its `checkpoint` row on its first run with `last_block = start_block − 1`, so `start_block` is fixed from then on. [Ingestion](03-ingestion.md#see-where-every-job-is) describes every column.
+A job creates its `checkpoint` row on its first run. Every column is `NOT NULL`, so the row needs a value for each before any block is read, and an insert without them fails with 23502. The first row holds `last_block = start_block − 1`, `last_block_ts = to_timestamp(0)`, `target_block = start_block − 1`, and `blocks_per_sec = 0`, inserted with `ON CONFLICT (worker) DO NOTHING`. A restart then inserts nothing and leaves `start_block` unchanged ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests), `spikes/crates/store`, `P12`). No route reads those placeholder values before the first commit. [Ingestion](03-ingestion.md#see-where-every-job-is) describes every column.
 
 ### Prices
 
 ```sql
 CREATE TABLE subnet_price (
-	ts               TIMESTAMPTZ NOT NULL,
-	block_number     INTEGER NOT NULL,
-	netuid           INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
-	price            BIGINT NOT NULL CHECK (price >= 0),
-	tao_reserve      BIGINT NOT NULL CHECK (tao_reserve >= 0),
-	alpha_reserve    BIGINT NOT NULL CHECK (alpha_reserve >= 0),
-	alpha_out        BIGINT NOT NULL CHECK (alpha_out >= 0),
-	lifetime_volume  NUMERIC(39,0) NOT NULL CHECK (lifetime_volume >= 0),
-	PRIMARY KEY (netuid, ts)
+    ts               TIMESTAMPTZ NOT NULL,
+    block_number     INTEGER NOT NULL,
+    netuid           INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
+    price            BIGINT NOT NULL CHECK (price >= 0),
+    tao_reserve      BIGINT NOT NULL CHECK (tao_reserve >= 0),
+    alpha_reserve    BIGINT NOT NULL CHECK (alpha_reserve >= 0),
+    alpha_out        BIGINT NOT NULL CHECK (alpha_out >= 0),
+    lifetime_volume  NUMERIC(39,0) NOT NULL CHECK (lifetime_volume >= 0),
+    PRIMARY KEY (netuid, ts)
 );
 SELECT create_hypertable('subnet_price', 'ts', chunk_time_interval => INTERVAL '1 day');
 ALTER TABLE subnet_price SET (
-	timescaledb.compress,
-	timescaledb.compress_segmentby = 'netuid',
-	timescaledb.compress_orderby = 'ts DESC'
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'netuid',
+    timescaledb.compress_orderby = 'ts DESC'
 );
 SELECT add_compression_policy('subnet_price', INTERVAL '2 days');
 SELECT add_retention_policy('subnet_price', INTERVAL '4 days');
 ```
 
-`price` is rao per whole alpha. `tao_reserve` is `SubnetTAO` plus `SubnetTaoProvided`, and `alpha_reserve` is `SubnetAlphaIn` plus `SubnetAlphaInProvided`. The provided terms are 0 when the block's metadata lacks them. `lifetime_volume` is the `u128` `SubnetVolume` counter. Root has no rows, so `netuid` starts at 1.
+`price` is rao per whole alpha. `tao_reserve` is `SubnetTAO` plus `SubnetTaoProvided`, and `alpha_reserve` is `SubnetAlphaIn` plus `SubnetAlphaInProvided`. The provided terms exist only in specs 290 to 422. The sum has no provided term when the spec that executed the block does not declare those items, which holds for every spec release 1 reads (475 to 490). An item that the metadata in use does not declare is absent. The two provided items are optional ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)), so their absence only drops the provided term. A subnet whose `SubnetTAO` or `SubnetAlphaIn` is not declared gets no row. A declared item with no stored key reads as its metadata default. Our code applies that default on the raw decode path, as shown for `Delegates` (`spikes/crates/chain-decode`, `default-from-metadata`). [D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec) and [chain data](02-chain-data.md#storage-items-and-runtime-apis) give the rule. `lifetime_volume` is the `u128` `SubnetVolume` counter. Root has no rows, so `netuid` starts at 1. `current_alpha_price_all` returns root at 10^9, and the job drops that entry.
 
 TimescaleDB requires the time column in every unique index, so `ts` is part of the primary key. One block has one timestamp, so `(netuid, ts)` is unique. `create_hypertable` also creates an index on `ts DESC`, which finds the newest row for `/pools`.
 
@@ -121,23 +148,23 @@ TimescaleDB requires the time column in every unique index, so `ts` is part of t
 
 ```sql
 CREATE TABLE validator (
-	hotkey                 BYTEA PRIMARY KEY CHECK (length(hotkey) = 32),
-	owner_coldkey          BYTEA CHECK (length(owner_coldkey) = 32),
-	name                   TEXT,
-	take                   INTEGER NOT NULL CHECK (take BETWEEN 0 AND 65535),
-	global_weighted_stake  NUMERIC(39,0) NOT NULL CHECK (global_weighted_stake >= 0),
-	global_nominators      INTEGER NOT NULL CHECK (global_nominators >= 0),
-	active_subnets         INTEGER NOT NULL CHECK (active_subnets >= 0),
-	snapshot_block         INTEGER NOT NULL
+    hotkey                 BYTEA PRIMARY KEY CHECK (length(hotkey) = 32),
+    owner_coldkey          BYTEA CHECK (length(owner_coldkey) = 32),
+    name                   TEXT,
+    take                   INTEGER NOT NULL CHECK (take BETWEEN 0 AND 65535),
+    global_weighted_stake  NUMERIC(39,0) NOT NULL CHECK (global_weighted_stake >= 0),
+    global_nominators      INTEGER NOT NULL CHECK (global_nominators >= 0),
+    active_subnets         INTEGER NOT NULL CHECK (active_subnets >= 0),
+    snapshot_block         INTEGER NOT NULL
 );
 CREATE INDEX ON validator (global_weighted_stake DESC, hotkey);
 
 CREATE TABLE validator_subnet (
-	hotkey          BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	netuid          INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	alpha_stake     BIGINT NOT NULL CHECK (alpha_stake >= 0),
-	snapshot_block  INTEGER NOT NULL,
-	PRIMARY KEY (hotkey, netuid)
+    hotkey          BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    netuid          INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    alpha_stake     BIGINT NOT NULL CHECK (alpha_stake >= 0),
+    snapshot_block  INTEGER NOT NULL,
+    PRIMARY KEY (hotkey, netuid)
 );
 CREATE INDEX ON validator_subnet (netuid, alpha_stake DESC, hotkey);
 ```
@@ -148,13 +175,13 @@ CREATE INDEX ON validator_subnet (netuid, alpha_stake DESC, hotkey);
 
 ```sql
 CREATE TABLE epoch_dividend (
-	ts              TIMESTAMPTZ NOT NULL,
-	block_number    INTEGER NOT NULL,
-	netuid          INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
-	hotkey          BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	dividend        BIGINT NOT NULL CHECK (dividend > 0),
-	stake_at_epoch  BIGINT NOT NULL CHECK (stake_at_epoch >= 0),
-	PRIMARY KEY (netuid, hotkey, ts)
+    ts              TIMESTAMPTZ NOT NULL,
+    block_number    INTEGER NOT NULL,
+    netuid          INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
+    hotkey          BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    dividend        BIGINT NOT NULL CHECK (dividend > 0),
+    stake_at_epoch  BIGINT NOT NULL CHECK (stake_at_epoch >= 0),
+    PRIMARY KEY (netuid, hotkey, ts)
 );
 SELECT create_hypertable('epoch_dividend', 'ts', chunk_time_interval => INTERVAL '7 days');
 CREATE INDEX ON epoch_dividend (netuid, ts DESC);
@@ -167,42 +194,44 @@ The job writes only nonzero dividends and skips root. The `(netuid, ts)` index s
 
 ```sql
 CREATE TABLE basket_snapshot (
-	ts            TIMESTAMPTZ NOT NULL,
-	block_number  INTEGER NOT NULL,
-	hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	rate_bits     NUMERIC(39,0) NOT NULL,
-	shares        NUMERIC(39,0) NOT NULL CHECK (shares >= 0),
-	nav_tao       BIGINT NOT NULL CHECK (nav_tao >= 0),
-	PRIMARY KEY (hotkey, ts)
+    ts            TIMESTAMPTZ NOT NULL,
+    block_number  INTEGER NOT NULL,
+    hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    rate_bits     NUMERIC(39,0) NOT NULL,
+    shares        NUMERIC(39,0) NOT NULL CHECK (shares >= 0),
+    nav_tao       BIGINT NOT NULL CHECK (nav_tao >= 0),
+    PRIMARY KEY (hotkey, ts)
 );
 SELECT create_hypertable('basket_snapshot', 'ts', chunk_time_interval => INTERVAL '7 days');
 SELECT add_retention_policy('basket_snapshot', INTERVAL '33 days');
 ```
 
-`rate_bits` is the raw `I96F32` of `BasketRate`, or 0 when the item is missing. `shares` is a `u64` on chain.
+`rate_bits` is the raw `I96F32` of `BasketRate`. A basket with no stored `BasketRate` key reads the item's metadata default, as any declared item does. If the executing spec does not declare `BasketRate`, the job writes no row ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)). `shares` is a `u64` on chain.
 
 ### Subnet identities
 
 ```sql
 CREATE TABLE subnet_identity (
-	netuid         INTEGER PRIMARY KEY CHECK (netuid BETWEEN 0 AND 65535),
-	name           TEXT,
-	description    TEXT,
-	url            TEXT,
-	github_repo    TEXT,
-	discord        TEXT,
-	contact        TEXT,
-	logo_url       TEXT,
-	additional     TEXT,
-	updated_block  INTEGER NOT NULL
+    netuid         INTEGER PRIMARY KEY CHECK (netuid BETWEEN 0 AND 65535),
+    name           TEXT,
+    description    TEXT,
+    url            TEXT,
+    github_repo    TEXT,
+    discord        TEXT,
+    contact        TEXT,
+    logo_url       TEXT,
+    additional     TEXT,
+    updated_block  INTEGER NOT NULL
 );
 ```
 
-Each text column is `NULL` when the decoded string is empty. A subnet whose identity exists with every field empty still has a row. `updated_block` is the block where the row last changed. The `identities` job writes only rows that changed, and deletes rows for subnets that no longer have an identity.
+Each text column is `NULL` when the decoded string is empty. A subnet whose identity exists with every field empty still has a row. `updated_block` is the block where the row last changed. The `identities` job writes only rows that changed, and deletes rows for subnets that have lost their identity ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests)). An unchanged row keeps its block, and a second pass at the same block writes nothing (`spikes/crates/store`, `P26`). Writing the whole set at every snapshot would move `updated_block` on every row, even with no change.
 
 ### Drop old chunks with retention policies
 
-Each windowed table drops chunks older than its window plus 2 days. The margin keeps a full window while the job runs a little behind, and a chunk is dropped whole, so rows can outlive the policy by up to one chunk.
+Each windowed table drops chunks older than its window plus 2 days. The margin keeps a full window while the job runs a little behind, and a chunk is dropped whole, so rows can outlive the policy by up to one chunk. The 4-day policy kept a row 4.50 days old, and the 33-day policy kept one 34.00 days old (`spikes/crates/store`, `retention`). The compression policy on `subnet_price` compresses only chunks that ended more than 2 days ago. A replay or a gap repair into a compressed chunk still works (`spikes/crates/store`, `compression`, `compressed-replay`).
+
+Each policy is created once, in the migration that creates its hypertable, as in the DDL above. A second `add_retention_policy` for the same table fails with 42710 ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests)).
 
 | Table | Job history | Retention |
 |---|---|---|
@@ -211,7 +240,19 @@ Each windowed table drops chunks older than its window plus 2 days. The margin k
 | `basket_snapshot` | `Window(31 days)` | 33 days |
 | `validator`, `validator_subnet`, `subnet_identity` | `Latest` | none. The job replaces the rows |
 
-If `jobs.prices.history` changes, a migration changes the policy to match.
+If `jobs.prices.history` changes, a new migration changes the policy to match. It calls `remove_retention_policy`, then `add_retention_policy` with the new interval (`spikes/crates/store`, `policy-change`).
+
+### Find gaps with a hashed DISTINCT
+
+The hourly gap check counts the blocks below the checkpoint that have no row. Write it with a `SELECT DISTINCT` subquery, which PostgreSQL hashes.
+
+```sql
+SELECT (max(cp.last_block) - min(d.b) + 1 - count(*))::bigint
+FROM (SELECT DISTINCT block_number AS b FROM subnet_price) d, checkpoint cp
+WHERE cp.worker = 'prices' AND d.b <= cp.last_block;
+```
+
+Over 4.64 million `subnet_price` rows this took about 0.12 s. The same count written as `count(DISTINCT p.block_number)` sorted 80 MB on disk and took 1.6 to 2.4 s, measured on 2026-11-12 (`spikes/crates/store`, `read-gap`).
 
 ## Release 2 schema
 
@@ -221,34 +262,34 @@ Release 2 adds the `events` and `subnets` jobs, the position folder, and the rec
 
 ```sql
 CREATE TABLE block (
-	number        INTEGER PRIMARY KEY,
-	hash          BYTEA NOT NULL UNIQUE CHECK (length(hash) = 32),
-	parent_hash   BYTEA NOT NULL CHECK (length(parent_hash) = 32),
-	ts            TIMESTAMPTZ NOT NULL,
-	spec_version  INTEGER NOT NULL REFERENCES runtime_version
+    number        INTEGER PRIMARY KEY,
+    hash          BYTEA NOT NULL UNIQUE CHECK (length(hash) = 32),
+    parent_hash   BYTEA NOT NULL CHECK (length(parent_hash) = 32),
+    ts            TIMESTAMPTZ NOT NULL,
+    spec_version  INTEGER NOT NULL REFERENCES runtime_version
 );
 
 CREATE TYPE staking_kind AS ENUM (
-	'stake_added', 'stake_removed', 'stake_moved', 'stake_transferred',
-	'stake_swapped', 'alpha_recycled', 'alpha_burned'
+    'stake_added', 'stake_removed', 'stake_moved', 'stake_transferred',
+    'stake_swapped', 'alpha_recycled', 'alpha_burned'
 );
 
 CREATE TABLE staking_action (
-	ts               TIMESTAMPTZ NOT NULL,
-	block_number     INTEGER NOT NULL,
-	event_index      INTEGER NOT NULL,
-	extrinsic_index  INTEGER,
-	kind             staking_kind NOT NULL,
-	coldkey          BYTEA NOT NULL CHECK (length(coldkey) = 32),
-	hotkey           BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	netuid           INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	tao              BIGINT CHECK (tao >= 0),
-	alpha            BIGINT CHECK (alpha >= 0),
-	fee              BIGINT CHECK (fee >= 0),
-	dest_coldkey     BYTEA CHECK (length(dest_coldkey) = 32),
-	dest_hotkey      BYTEA CHECK (length(dest_hotkey) = 32),
-	dest_netuid      INTEGER CHECK (dest_netuid BETWEEN 0 AND 65535),
-	PRIMARY KEY (ts, block_number, event_index)
+    ts               TIMESTAMPTZ NOT NULL,
+    block_number     INTEGER NOT NULL,
+    event_index      INTEGER NOT NULL,
+    extrinsic_index  INTEGER,
+    kind             staking_kind NOT NULL,
+    coldkey          BYTEA NOT NULL CHECK (length(coldkey) = 32),
+    hotkey           BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    netuid           INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    tao              BIGINT CHECK (tao >= 0),
+    alpha            BIGINT CHECK (alpha >= 0),
+    fee              BIGINT CHECK (fee >= 0),
+    dest_coldkey     BYTEA CHECK (length(dest_coldkey) = 32),
+    dest_hotkey      BYTEA CHECK (length(dest_hotkey) = 32),
+    dest_netuid      INTEGER CHECK (dest_netuid BETWEEN 0 AND 65535),
+    PRIMARY KEY (ts, block_number, event_index)
 );
 SELECT create_hypertable('staking_action', 'ts', chunk_time_interval => INTERVAL '7 days');
 CREATE INDEX ON staking_action (coldkey, ts DESC);
@@ -256,56 +297,56 @@ CREATE INDEX ON staking_action (hotkey, ts DESC);
 CREATE INDEX ON staking_action (netuid, ts DESC);
 
 CREATE TABLE transfer (
-	ts            TIMESTAMPTZ NOT NULL,
-	block_number  INTEGER NOT NULL,
-	event_index   INTEGER NOT NULL,
-	from_account  BYTEA NOT NULL CHECK (length(from_account) = 32),
-	to_account    BYTEA NOT NULL CHECK (length(to_account) = 32),
-	amount        BIGINT NOT NULL CHECK (amount >= 0),
-	PRIMARY KEY (ts, block_number, event_index)
+    ts            TIMESTAMPTZ NOT NULL,
+    block_number  INTEGER NOT NULL,
+    event_index   INTEGER NOT NULL,
+    from_account  BYTEA NOT NULL CHECK (length(from_account) = 32),
+    to_account    BYTEA NOT NULL CHECK (length(to_account) = 32),
+    amount        BIGINT NOT NULL CHECK (amount >= 0),
+    PRIMARY KEY (ts, block_number, event_index)
 );
 SELECT create_hypertable('transfer', 'ts', chunk_time_interval => INTERVAL '7 days');
 CREATE INDEX ON transfer (from_account, ts DESC);
 CREATE INDEX ON transfer (to_account, ts DESC);
 
 CREATE TYPE basket_flow_kind AS ENUM (
-	'deposited', 'staked_in', 'claimed', 'holding_converted'
+    'deposited', 'staked_in', 'claimed', 'holding_converted'
 );
 
 CREATE TABLE basket_flow (
-	ts            TIMESTAMPTZ NOT NULL,
-	block_number  INTEGER NOT NULL,
-	event_index   INTEGER NOT NULL,
-	kind          basket_flow_kind NOT NULL,
-	hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	coldkey       BYTEA CHECK (length(coldkey) = 32),
-	netuid        INTEGER CHECK (netuid BETWEEN 0 AND 65535),
-	tao           BIGINT NOT NULL CHECK (tao >= 0),
-	value_tao     BIGINT CHECK (value_tao >= 0),
-	shares        NUMERIC(39,0) CHECK (shares >= 0),
-	PRIMARY KEY (ts, block_number, event_index)
+    ts            TIMESTAMPTZ NOT NULL,
+    block_number  INTEGER NOT NULL,
+    event_index   INTEGER NOT NULL,
+    kind          basket_flow_kind NOT NULL,
+    hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    coldkey       BYTEA CHECK (length(coldkey) = 32),
+    netuid        INTEGER CHECK (netuid BETWEEN 0 AND 65535),
+    tao           BIGINT NOT NULL CHECK (tao >= 0),
+    value_tao     BIGINT CHECK (value_tao >= 0),
+    shares        NUMERIC(39,0) CHECK (shares >= 0),
+    PRIMARY KEY (ts, block_number, event_index)
 );
 SELECT create_hypertable('basket_flow', 'ts', chunk_time_interval => INTERVAL '7 days');
 CREATE INDEX ON basket_flow (hotkey, ts DESC);
 CREATE INDEX ON basket_flow (coldkey, ts DESC) WHERE coldkey IS NOT NULL;
 
 CREATE TYPE position_event_kind AS ENUM (
-	'hotkey_swapped', 'hotkey_swapped_on_subnet', 'coldkey_swapped',
-	'root_claimed', 'liquidity_changed',
-	'network_added', 'network_removed', 'network_cleanup_completed'
+    'hotkey_swapped', 'hotkey_swapped_on_subnet', 'coldkey_swapped',
+    'root_claimed', 'liquidity_changed',
+    'network_added', 'network_removed', 'network_cleanup_completed'
 );
 
 CREATE TABLE position_event (
-	block_number  INTEGER NOT NULL,
-	event_index   INTEGER NOT NULL,
-	kind          position_event_kind NOT NULL,
-	netuid        INTEGER CHECK (netuid BETWEEN 0 AND 65535),
-	coldkey       BYTEA CHECK (length(coldkey) = 32),
-	new_coldkey   BYTEA CHECK (length(new_coldkey) = 32),
-	hotkey        BYTEA CHECK (length(hotkey) = 32),
-	new_hotkey    BYTEA CHECK (length(new_hotkey) = 32),
-	mechanism     INTEGER CHECK (mechanism BETWEEN 0 AND 65535),
-	PRIMARY KEY (block_number, event_index)
+    block_number  INTEGER NOT NULL,
+    event_index   INTEGER NOT NULL,
+    kind          position_event_kind NOT NULL,
+    netuid        INTEGER CHECK (netuid BETWEEN 0 AND 65535),
+    coldkey       BYTEA CHECK (length(coldkey) = 32),
+    new_coldkey   BYTEA CHECK (length(new_coldkey) = 32),
+    hotkey        BYTEA CHECK (length(hotkey) = 32),
+    new_hotkey    BYTEA CHECK (length(new_hotkey) = 32),
+    mechanism     INTEGER CHECK (mechanism BETWEEN 0 AND 65535),
+    PRIMARY KEY (block_number, event_index)
 );
 ```
 
@@ -319,22 +360,22 @@ TimescaleDB requires the time column in every unique index, so `ts` leads the pr
 
 ```sql
 CREATE TABLE reconcile_request (
-	block_number  INTEGER NOT NULL,
-	coldkey       BYTEA NOT NULL CHECK (length(coldkey) = 32),
-	reason        TEXT NOT NULL,
-	fulfilled_at  TIMESTAMPTZ,
-	PRIMARY KEY (block_number, coldkey)
+    block_number  INTEGER NOT NULL,
+    coldkey       BYTEA NOT NULL CHECK (length(coldkey) = 32),
+    reason        TEXT NOT NULL,
+    fulfilled_at  TIMESTAMPTZ,
+    PRIMARY KEY (block_number, coldkey)
 );
 CREATE INDEX ON reconcile_request (block_number) WHERE fulfilled_at IS NULL;
 
 CREATE TABLE position_settle (
-	block_number  INTEGER NOT NULL,
-	coldkey       BYTEA NOT NULL CHECK (length(coldkey) = 32),
-	hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	netuid        INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	alpha         BIGINT NOT NULL CHECK (alpha >= 0),
-	drift         BIGINT,
-	PRIMARY KEY (block_number, coldkey, hotkey, netuid)
+    block_number  INTEGER NOT NULL,
+    coldkey       BYTEA NOT NULL CHECK (length(coldkey) = 32),
+    hotkey        BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    netuid        INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    alpha         BIGINT NOT NULL CHECK (alpha >= 0),
+    drift         BIGINT,
+    PRIMARY KEY (block_number, coldkey, hotkey, netuid)
 );
 ```
 
@@ -344,34 +385,34 @@ The folder inserts `reconcile_request` rows. The reconciler sets `fulfilled_at`.
 
 ```sql
 CREATE TABLE subnet (
-	netuid            INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	registered_block  INTEGER NOT NULL,
-	removed_block     INTEGER,
-	cleanup_block     INTEGER,
-	mechanism         INTEGER NOT NULL CHECK (mechanism BETWEEN 0 AND 65535),
-	PRIMARY KEY (netuid, registered_block),
-	CHECK (removed_block IS NULL OR removed_block >= registered_block)
+    netuid            INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    registered_block  INTEGER NOT NULL,
+    removed_block     INTEGER,
+    cleanup_block     INTEGER,
+    mechanism         INTEGER NOT NULL CHECK (mechanism BETWEEN 0 AND 65535),
+    PRIMARY KEY (netuid, registered_block),
+    CHECK (removed_block IS NULL OR removed_block >= registered_block)
 );
 CREATE UNIQUE INDEX ON subnet (netuid) WHERE removed_block IS NULL;
 
 CREATE TABLE position (
-	coldkey            BYTEA NOT NULL CHECK (length(coldkey) = 32),
-	hotkey             BYTEA NOT NULL CHECK (length(hotkey) = 32),
-	netuid             INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	alpha              BIGINT NOT NULL CHECK (alpha >= 0),
-	shortfall          BIGINT NOT NULL DEFAULT 0 CHECK (shortfall >= 0),
-	last_action_block  INTEGER NOT NULL,
-	last_settle_block  INTEGER,
-	PRIMARY KEY (coldkey, hotkey, netuid)
+    coldkey            BYTEA NOT NULL CHECK (length(coldkey) = 32),
+    hotkey             BYTEA NOT NULL CHECK (length(hotkey) = 32),
+    netuid             INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    alpha              BIGINT NOT NULL CHECK (alpha >= 0),
+    shortfall          BIGINT NOT NULL DEFAULT 0 CHECK (shortfall >= 0),
+    last_action_block  INTEGER NOT NULL,
+    last_settle_block  INTEGER,
+    PRIMARY KEY (coldkey, hotkey, netuid)
 );
 CREATE INDEX ON position (netuid, alpha DESC) WHERE alpha > 0;
 CREATE INDEX ON position (hotkey, netuid);
 
 CREATE TABLE subnet_holder_count (
-	netuid   INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
-	day      DATE NOT NULL,
-	holders  INTEGER NOT NULL CHECK (holders >= 0),
-	PRIMARY KEY (netuid, day)
+    netuid   INTEGER NOT NULL CHECK (netuid BETWEEN 0 AND 65535),
+    day      DATE NOT NULL,
+    holders  INTEGER NOT NULL CHECK (holders >= 0),
+    PRIMARY KEY (netuid, day)
 );
 ```
 
@@ -385,67 +426,64 @@ The folder writes one `subnet_holder_count` row per subnet at the first block of
 
 ```sql
 CREATE TABLE subnet_snapshot (
-	ts                  TIMESTAMPTZ NOT NULL,
-	block_number        INTEGER NOT NULL,
-	netuid              INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
-	tao_in              BIGINT NOT NULL CHECK (tao_in >= 0),
-	alpha_in            BIGINT NOT NULL CHECK (alpha_in >= 0),
-	alpha_out           BIGINT NOT NULL CHECK (alpha_out >= 0),
-	moving_price_bits   NUMERIC(39,0) NOT NULL,
-	ema_tao_flow_bits   NUMERIC(39,0),
-	tao_in_emission     BIGINT NOT NULL CHECK (tao_in_emission >= 0),
-	alpha_in_emission   BIGINT NOT NULL CHECK (alpha_in_emission >= 0),
-	alpha_out_emission  BIGINT NOT NULL CHECK (alpha_out_emission >= 0),
-	excess_tao          BIGINT CHECK (excess_tao >= 0),
-	emission_enabled    BOOLEAN,
-	lifetime_volume     NUMERIC(39,0) NOT NULL CHECK (lifetime_volume >= 0),
-	tempo               INTEGER NOT NULL CHECK (tempo BETWEEN 0 AND 65535),
-	fee_rate            INTEGER CHECK (fee_rate BETWEEN 0 AND 65535),
-	PRIMARY KEY (netuid, ts)
+    ts                  TIMESTAMPTZ NOT NULL,
+    block_number        INTEGER NOT NULL,
+    netuid              INTEGER NOT NULL CHECK (netuid BETWEEN 1 AND 65535),
+    tao_in              BIGINT NOT NULL CHECK (tao_in >= 0),
+    alpha_in            BIGINT NOT NULL CHECK (alpha_in >= 0),
+    alpha_out           BIGINT NOT NULL CHECK (alpha_out >= 0),
+    moving_price_bits   NUMERIC(39,0) NOT NULL,
+    ema_tao_flow_bits   NUMERIC(39,0),
+    tao_in_emission     BIGINT NOT NULL CHECK (tao_in_emission >= 0),
+    alpha_in_emission   BIGINT NOT NULL CHECK (alpha_in_emission >= 0),
+    alpha_out_emission  BIGINT NOT NULL CHECK (alpha_out_emission >= 0),
+    excess_tao          BIGINT CHECK (excess_tao >= 0),
+    emission_enabled    BOOLEAN,
+    lifetime_volume     NUMERIC(39,0) NOT NULL CHECK (lifetime_volume >= 0),
+    tempo               INTEGER NOT NULL CHECK (tempo BETWEEN 0 AND 65535),
+    fee_rate            INTEGER CHECK (fee_rate BETWEEN 0 AND 65535),
+    PRIMARY KEY (netuid, ts)
 );
 SELECT create_hypertable('subnet_snapshot', 'ts', chunk_time_interval => INTERVAL '30 days');
 ALTER TABLE subnet_snapshot SET (
-	timescaledb.compress,
-	timescaledb.compress_segmentby = 'netuid',
-	timescaledb.compress_orderby = 'ts DESC'
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'netuid',
+    timescaledb.compress_orderby = 'ts DESC'
 );
 SELECT add_compression_policy('subnet_snapshot', INTERVAL '60 days');
 ```
 
-`ema_tao_flow_bits` is the raw `I64F64` from the second field of `SubnetEmaTaoFlow`, and `NULL` before spec 334 or when the item is absent. Columns for items that a spec lacks are `NULL`.
+`ema_tao_flow_bits` is the raw `I64F64` from the second field of `SubnetEmaTaoFlow`, and `NULL` before spec 334 or when the item is absent. `SubnetEmaTaoFlow` is a named exception to the rule of [D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec). For any other item that a row requires, an absent item means the job writes no row. `excess_tao`, `emission_enabled`, and `fee_rate` are also nullable. Whether their items join the exceptions is open for release 2.
 
 ### Aggregates
 
-Each continuous aggregate is created `WITH NO DATA`, in its own migration file that starts with `-- no-transaction`. sqlx runs such a file as one simple query, and `CREATE MATERIALIZED VIEW ... WITH DATA` cannot run inside the implicit transaction of a multi-statement query. With `WITH NO DATA`, the file can also hold the refresh policy and the `materialized_only` setting.
+Each continuous aggregate is created `WITH NO DATA`, in an ordinary migration that sqlx runs in its usual transaction. `CREATE MATERIALIZED VIEW ... WITH DATA` cannot run inside a transaction and fails with 25001. `WITH NO DATA`, the refresh policy and the `materialized_only` setting all run inside one, and stay atomic with sqlx's insert into `_sqlx_migrations` (`spikes/crates/store`, `no-tx-cagg`). So every release 1 and release 2 migration runs in a transaction ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests)).
 
 ```sql
--- no-transaction
 CREATE MATERIALIZED VIEW IF NOT EXISTS candle_1m
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
-	netuid,
-	time_bucket('1 minute', ts)       AS bucket,
-	first(price, ts)                  AS open,
-	max(price)                        AS high,
-	min(price)                        AS low,
-	last(price, ts)                   AS close,
-	first(lifetime_volume, ts)        AS volume_open,
-	last(lifetime_volume, ts)         AS volume_close,
-	count(*)                          AS points
+    netuid,
+    time_bucket('1 minute', ts)       AS bucket,
+    first(price, ts)                  AS open,
+    max(price)                        AS high,
+    min(price)                        AS low,
+    last(price, ts)                   AS close,
+    first(lifetime_volume, ts)        AS volume_open,
+    last(lifetime_volume, ts)         AS volume_close,
+    count(*)                          AS points
 FROM subnet_price
 GROUP BY netuid, bucket
 WITH NO DATA;
 
 SELECT add_continuous_aggregate_policy('candle_1m',
-	start_offset => INTERVAL '1 hour',
-	end_offset => INTERVAL '1 minute',
-	schedule_interval => INTERVAL '1 minute',
-	if_not_exists => true);
+    start_offset => INTERVAL '1 hour',
+    end_offset => INTERVAL '1 minute',
+    schedule_interval => INTERVAL '1 minute',
+    if_not_exists => true);
 ```
 
 `materialized_only = false` is not the default, so each view sets it. A query then also sees the newest bucket that has not been refreshed yet.
-
-A migration run outside a transaction is not atomic with sqlx's insert into `_sqlx_migrations`. A crash between the two reruns the file, so each statement uses `IF NOT EXISTS` or `if_not_exists => true`.
 
 `candle_5m`, `candle_15m`, and `candle_1h` aggregate `candle_1m`. `candle_4h`, `candle_1d`, and `candle_1w` aggregate `candle_1h`. Each level reads the level below it, not the raw prices, and takes `first(volume_open)` and `last(volume_close)` of its inputs.
 
@@ -455,29 +493,33 @@ A candle's volume is `volume_close` minus the previous candle's `volume_close`, 
 
 `bt-indexer migrate` applies the migrations in `crates/store/migrations/` with `sqlx::migrate!`. Neither `ingest` nor `serve` applies migrations at start. Each checks that the database is at the version it was built for and exits with an error if it is not. Two processes that both migrate at start can race. A deploy that migrates as its own step can also stop before the new code runs.
 
-Migrations move forward only. To undo one, write a new one.
+- `migrate` runs on a single connection, not a pool, and exits on the first error ([D16](../decisions.md#d16-set-the-stores-rules-for-migrations-writes-and-tests)). A failed `Migrator::run` keeps its advisory lock on the connection it used, and a second run on another connection then waits forever (`spikes/crates/store`, `migrate-lock`). Tests never reuse a pool that ran migrations.
+- `migrate` prints each version it applied as `{:04}_{description}`, with the spaces in sqlx's description replaced by `_`, such as `0001_pipeline_state`. It finds them by comparing `list_applied_migrations()` before and after the run.
+- The version check of `ingest` and `serve` tells three cases apart without running anything: the database is behind, it is ahead of the binary, or an applied file was edited. sqlx's own `run` reports the last two as `VersionMissing` and `VersionMismatch` (`spikes/crates/store`, `check-version`).
+
+A second run of `migrate` applies nothing. Migrations move forward only. To undo one, write a new one.
 
 ## Size the database
 
-These numbers are estimates, not measurements. Replace them with `hypertable_detailed_size` output after the first backfill. Each row size includes about 40 bytes of primary key index.
+Row counts below come from chain measurements on 2026-11-12 where they say so. Sizes per row come from synthetic rows loaded at release 1 counts (`spikes/crates/store`, `reads-data`, `sizes`). Synthetic values compress better than chain data, so the sizes below are estimates. After the first backfill, replace them with `hypertable_detailed_size` output. The chain produces about 7,197 blocks a day at the measured 12.0 s block time.
 
 ### Release 1
 
-- **`subnet_price`** has one row per subnet per block. Two days are about 129 × 14,400 = 1.9 million rows. Retention keeps up to 4 days plus one 1-day chunk, about 4.6 million rows. At about 130 bytes per row, that is about 600 MB before compression, and less once chunks older than 2 days compress.
-- **`epoch_dividend`** has one row per validator with a nonzero dividend per subnet epoch. About 128 subnets at a tempo of 360 run about 2,550 epochs per day. At about 30 paid validators per epoch, a guess, that is about 77,000 rows per day, and about 3 million rows over 33 days plus one chunk. At about 120 bytes per row, that is about 360 MB.
-- **`basket_snapshot`** has one row per validator with a basket every 500 blocks, about 14 per day. At 50 validators, a guess, 40 days hold about 29,000 rows.
-- **`validator`**, **`validator_subnet`**, and **`subnet_identity`** hold the current set only, a few thousand rows.
-- **`runtime_version`** holds about 1 MB of metadata per spec. Release 1 meets only the few specs in its windows.
+- **`subnet_price`** has one row per subnet per block. Two days are about 128 × 14,400 = 1.8 million rows. Retention keeps up to 4 days plus one 1-day chunk, about 4.6 million rows. The synthetic 4,644,000 rows took 306 MB with 3 of 6 chunks compressed. One uncompressed 1-day chunk was 117 MB, and 6.3 MB once compressed.
+- **`epoch_dividend`** has one row per validator with a nonzero dividend per subnet epoch. About 128 subnets at a tempo of 360 run about 2,550 epochs per day. About 50 validators are paid per epoch (measured on 2026-11-12), so that is about 130,000 rows per day. The synthetic 3,072,000 rows took about 660 MB, 297 MB of table and 363 MB of indexes, because the table carries three indexes. That is about 215 bytes per row. Retention keeps 33 days plus up to one 7-day chunk, about 5.2 million rows, so about 1.1 GB at that row size.
+- **`basket_snapshot`** has one row per validator with a basket every 500 blocks, about 14 per day. A snapshot holds about 190 baskets (191 in one measured snapshot), so 40 days hold about 109,000 rows. The synthetic 28,000 rows took 6.5 MB, so this is about 25 MB.
+- **`validator`**, **`validator_subnet`**, and **`subnet_identity`** hold the current set only. At 9,490,000 the chain had 2,738 validator rows and 121 subnet identities against 128 subnets.
+- **`runtime_version`** holds at most about 0.45 MB of metadata per spec. Release 1 reads only specs 475 to 490, which are 11 specs and about 5 MB ([D3](../decisions.md#d3-set-the-milestone-scope-by-what-release-1-reads)).
 
-Release 1 needs about 1 GB. Plan for 10 GB of disk.
+Release 1 needs about 2 GB. Plan for 10 GB of disk.
 
 ### Release 2
 
-- **`subnet_price`** keeps full history. About 4.69 million blocks since the dTAO start, times an average of about 100 subnets over that period, gives about 470 million rows. The average subnet count is a guess, since the count grew from 64 to about 129. At about 130 bytes per row, that is about 61 GB uncompressed. At the 10 times compression that TimescaleDB documents, it is about 6 GB.
-- **`subnet_snapshot`** has about 100 rows every 100 blocks, about 4.7 million rows and under 1 GB.
-- **`staking_action`**, **`transfer`**, and **`basket_flow`** depend on how many events the chain emitted, which we have not measured. Count the events in a sample of 10,000 blocks during the first backfill, then extrapolate.
-- **`block`** has 4.69 million rows of about 120 bytes, about 560 MB.
+- **`subnet_price`** keeps full history. About 4.57 million blocks from the dTAO start at 4,920,350 to the head of 9,490,862 on 2026-11-12 (`spikes/crates/chain-specs`, `P29`), times an average of about 100 subnets over that period, gives about 457 million rows. The average subnet count is approximate, because the count grew from 64 to 128. At about 130 bytes per row, that is about 59 GB uncompressed. At the 10 times compression that TimescaleDB documents, it is about 6 GB. A synthetic compressed day shrank about 18 times.
+- **`subnet_snapshot`** has about 100 rows every 100 blocks, about 4.6 million rows and under 1 GB.
+- **`staking_action`**, **`transfer`**, and **`basket_flow`** depend on how many events the chain emitted. Count the events in a sample of 10,000 blocks during the first backfill, then extrapolate.
+- **`block`** has about 4.57 million rows of about 120 bytes, about 550 MB.
 - **`position`** and **`position_settle`** depend on the coldkey count. The daily reconcile writes one settle per position per day.
-- **`runtime_version`** holds fewer than 300 specs, under 300 MB.
+- **`runtime_version`** holds one row per spec: the spec 219 base row and the 106 specs mainnet ran from the dTAO start to 2026-11-12, at most about 0.45 MB each, so under 50 MB.
 
-Plan for 100 GB of disk for release 2, and check the estimate after the first backfill.
+Provision 100 GB of disk for release 2, and check the estimate after the first backfill.
