@@ -510,7 +510,7 @@ tao-data-api is one client behind one address, and it has its own per-client lim
 
 ## D32. Name the crates `bt-<name>`
 
-**Decision.** Directories are `crates/{domain,chain,ingest,store,api,telemetry}` and `bin/indexer`. Packages are `bt-domain`, `bt-chain`, `bt-store`, `bt-ingest`, `bt-api`, `bt-telemetry`, and `bt-indexer`. Every command uses `-p bt-<name>`.
+**Decision.** Directories are `crates/{domain,chain,ingest,store,api,telemetry,indexer}`. Packages are `bt-domain`, `bt-chain`, `bt-ingest`, `bt-store`, `bt-api`, `bt-telemetry`, and `bt-indexer`. Every command uses `-p bt-<name>`.
 
 **Reason.** Every crate name must start with `bt_`. Cargo selects a package by its name, so a package named `bt-chain` does not match `-p chain` (`spikes/crates/chain-decode`, `P20`).
 

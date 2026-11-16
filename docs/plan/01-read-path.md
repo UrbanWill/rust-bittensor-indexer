@@ -22,7 +22,7 @@ The keyed archive node allows 200 calls a second per key and answers JSON-RPC `-
 ## Step 1. `build: create the workspace and print a block's runtime specs`
 
 - **Goal.** Replace the `cargo init` package with a two-crate workspace, and print which spec executed a block and which spec its state holds. The line it prints for block 4,920,350 shows the rule the whole design rests on. Spec 219 executed that block, and its state already reports spec 233. So its storage and events decode with 219's metadata, and a runtime API call at it runs 233's code ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)).
-- **Files.** Delete `src/main.rs`. Write the root `Cargo.toml`, `rust-toolchain.toml`, `clippy.toml`, `crates/chain/Cargo.toml`, `crates/chain/src/lib.rs`, `bin/indexer/Cargo.toml`, and `bin/indexer/src/main.rs`.
+- **Files.** Delete `src/main.rs`. Write the root `Cargo.toml`, `rust-toolchain.toml`, `clippy.toml`, `crates/chain/Cargo.toml`, `crates/chain/src/lib.rs`, `crates/indexer/Cargo.toml`, and `crates/indexer/src/main.rs`.
 - **Who writes what.** You write all of it. Then ask the agent to review. Review checks:
   - No `unwrap`, `expect`, or `panic!` in `bt-chain`.
   - `anyhow` appears only in `bt-indexer`.
@@ -89,7 +89,7 @@ git switch -c step-01
    ```toml
    [workspace]
    resolver = "3"
-   members = ["bin/indexer", "crates/chain"]
+   members = ["crates/chain", "crates/indexer"]
 
    [workspace.package]
    version = "0.1.0"
@@ -132,7 +132,7 @@ git switch -c step-01
    workspace = true
    ```
 
-6. Write `bin/indexer/Cargo.toml`.
+6. Write `crates/indexer/Cargo.toml`.
 
    ```toml
    [package]
@@ -204,7 +204,7 @@ git switch -c step-01
    }
    ```
 
-8. Write `bin/indexer/src/main.rs` with this shape. The `///` lines on the clap types become the `--help` text.
+8. Write `crates/indexer/src/main.rs` with this shape. The `///` lines on the clap types become the `--help` text.
 
    ```rust
    //! The `bt-indexer` binary.
@@ -314,7 +314,7 @@ git add -A
 git status --short
 ```
 
-Expect `D  src/main.rs`, `M  Cargo.toml`, `A  Cargo.lock`, `A  clippy.toml`, `A  rust-toolchain.toml`, and the four new files under `bin/` and `crates/`. Nothing under `target/` may appear. If a file is missing or extra, fix it and run `git add -A` again.
+Expect `D  src/main.rs`, `M  Cargo.toml`, `A  Cargo.lock`, `A  clippy.toml`, `A  rust-toolchain.toml`, and the four new files under `crates/`. Nothing under `target/` may appear. If a file is missing or extra, fix it and run `git add -A` again.
 
 ```sh
 git commit -m "build: create the workspace and print a block's runtime specs" \
@@ -341,7 +341,7 @@ You are done when `git log --oneline -1` shows the new subject and the four chec
 ## Step 3. `feat(domain): parse block numbers and specs into newtypes at the CLI`
 
 - **Goal.** Start `bt-domain` with the first newtypes, and reject a block number that does not fit `u32` before it reaches the chain code. `BlockRef` carries both specs of the block, so every later read can pick the right metadata ([D6](../decisions.md#d6-decode-storage-and-events-with-the-executing-spec-and-runtime-apis-with-the-blocks-own-spec)).
-- **Files.** `crates/domain/{Cargo.toml,src/lib.rs,src/block.rs}`. Edit `crates/chain/src/lib.rs` and `bin/indexer/src/main.rs`. Add `crates/domain` to the workspace members and `bt-domain` to `[workspace.dependencies]`. Dependencies: see [the table](README.md#dependencies-by-step).
+- **Files.** `crates/domain/{Cargo.toml,src/lib.rs,src/block.rs}`. Edit `crates/chain/src/lib.rs` and `crates/indexer/src/main.rs`. Add `crates/domain` to the workspace members and `bt-domain` to `[workspace.dependencies]`. Dependencies: see [the table](README.md#dependencies-by-step).
 - **Shape.**
 
   ```rust
@@ -487,7 +487,7 @@ You are done when `git log --oneline -1` shows the new subject and the four chec
 ## Step 6. `feat(chain): classify node errors and time-bound every call`
 
 - **Goal.** Every node call goes through two layers ([D21](../decisions.md#d21-call-the-node-in-two-layers)). In `SubxtSource`, `classified` turns each raw request's `subxt::Error` into a `ChainError` variant ([Error handling](../design/06-error-handling.md#classify-subxterror-when-it-enters-the-crate), [D22](../decisions.md#d22-classify-chain-errors-by-what-the-node-sends-and-bound-the-clients-waits-with-our-own-timeouts)). On `Chain<S>`, `call` wraps each `BlockSource` method in the timeout, so a slow call ends the same way on every source. Step 1's `unknown` helper goes away.
-- **Files.** `crates/chain/src/error.rs`, `crates/chain/src/source.rs` (`classified` and `classify`), `crates/chain/src/lib.rs` (`Chain::call`), `crates/domain/src/disposition.rs`, and the `--rpc-timeout-ms` flag of `chain read` in `bin/indexer/src/main.rs`. Dependencies: see [the table](README.md#dependencies-by-step).
+- **Files.** `crates/chain/src/error.rs`, `crates/chain/src/source.rs` (`classified` and `classify`), `crates/chain/src/lib.rs` (`Chain::call`), `crates/domain/src/disposition.rs`, and the `--rpc-timeout-ms` flag of `chain read` in `crates/indexer/src/main.rs`. Dependencies: see [the table](README.md#dependencies-by-step).
 - **Shape.**
 
   ```rust

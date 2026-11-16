@@ -34,5 +34,17 @@ enum ChainCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    todo!();
+    match Cli::parse().cmd {
+        Cmd::Chain {
+            cmd: ChainCmd::Spec { url, block },
+        } => {
+            let chain = Chain::connect(&url).await?;
+            let s = chain.spec_at(block).await?;
+            println!(
+                "block={} hash={:?} executed_by={} state={}",
+                s.number, s.hash, s.executed_by, s.state
+            );
+        }
+    }
+    Ok(())
 }

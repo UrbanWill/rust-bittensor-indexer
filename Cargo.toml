@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bin/indexer", "crates/chain"]
+members = ["crates/chain", "crates/indexer"]
 
 [workspace.package]
 version = "0.1.0"

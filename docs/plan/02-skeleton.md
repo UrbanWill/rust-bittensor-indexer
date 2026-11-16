@@ -160,7 +160,7 @@ The skeleton reads one block at a time, on purpose. Stage 4 puts the real runner
 ## Step 12. `feat(domain): compute lag, percent done, and ETA in one function`
 
 - **Goal.** One pure function turns a checkpoint row, the job's schedule, and the head into every progress number, and `status` prints the full table of [Ingestion](../design/03-ingestion.md#the-command-line). Lag and percent done measure to `newest_scheduled(schedule, head)`, not to the raw head ([D20](../decisions.md#d20-measure-lag-and-readiness-against-the-schedule)).
-- **Files.** `crates/domain/src/progress.rs`, `crates/domain/src/schedule.rs`, `bin/indexer/src/status.rs`.
+- **Files.** `crates/domain/src/progress.rs`, `crates/domain/src/schedule.rs`, `crates/indexer/src/status.rs`.
 - **Shape.**
 
   ```rust

@@ -94,8 +94,7 @@ crates/
     store/        sqlx repositories, batch writers, migrations, and every query the API runs.
     api/          Axum router. compat/ holds the frozen routes, ops/ the operational endpoints, and v1/ the release 2 native API.
     telemetry/    Tracing subscriber and metrics exporter setup.
-bin/
-    indexer/      The bt-indexer binary.
+    indexer/      The bt-indexer binary. It wires the other crates together.
 tests/
     compat/       The Node script and the pinned copy of tao-data-api's Zod schemas.
 deploy/
@@ -109,7 +108,7 @@ fixtures/
 docs/
 ```
 
-Each directory is one package named `bt-<name>`: `bt-domain`, `bt-chain`, `bt-ingest`, `bt-store`, `bt-api`, `bt-telemetry`, and `bt-indexer` for `bin/indexer`. Every command names the package, as in `cargo nextest run -p bt-chain` ([D32](../decisions.md#d32-name-the-crates-bt-name)).
+Each directory under `crates/` is one package named `bt-<name>`: `bt-domain`, `bt-chain`, `bt-ingest`, `bt-store`, `bt-api`, `bt-telemetry`, and `bt-indexer`. `bt-indexer` is the only binary, and the others are libraries. Every command names the package, as in `cargo nextest run -p bt-chain` ([D32](../decisions.md#d32-name-the-crates-bt-name)).
 
 The fixture layout is the one in [quality](09-quality.md#test-the-decoders-against-recorded-blocks). Each state fixture is named for its test case, as in `fixtures/state/prices_head.json`, and holds its block number inside. Metadata files are committed only for the specs a test uses, and a validator snapshot is committed as a trimmed subset ([D34](../decisions.md#d34-keep-one-fixture-per-test-case-and-record-it-by-running-the-jobs-own-read)). Release 1 tests exercise the fixtures of specs 475 to 490. The older era fixtures exist for release 2.
 

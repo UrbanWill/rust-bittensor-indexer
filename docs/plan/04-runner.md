@@ -7,7 +7,7 @@ Configuration arrives in step 32. Until then the config types this stage needs, 
 ## Step 24. `feat(ingest): persist runtime versions and refill the cache on start`
 
 - **Goal.** Every spec a job needs lands in `runtime_version` with its true `first_block` and its metadata, the first time a job needs it, and a restart loads the table instead of asking the node again. In M0 the table lives in memory, and M1 persists it ([D8](../decisions.md#d8-find-the-spec-table-by-bisection-over-code-and-persist-only-the-specs-a-job-window-touches)).
-- **Files.** `crates/domain/src/runtime.rs`, `crates/chain/src/runtimes.rs`, `crates/chain/src/versions.rs`, `crates/chain/src/upgrades.rs`, `crates/chain/tests/specs.rs`, `crates/store/src/runtime_version.rs`, `crates/ingest/src/head.rs`, `bin/indexer/src/main.rs`.
+- **Files.** `crates/domain/src/runtime.rs`, `crates/chain/src/runtimes.rs`, `crates/chain/src/versions.rs`, `crates/chain/src/upgrades.rs`, `crates/chain/tests/specs.rs`, `crates/store/src/runtime_version.rs`, `crates/ingest/src/head.rs`, `crates/indexer/src/main.rs`.
 - **Shape.**
 
   ```rust
@@ -136,7 +136,7 @@ Configuration arrives in step 32. Until then the config types this stage needs, 
 ## Step 28. `feat(ingest): stop every task on one token and exit with the right code`
 
 - **Goal.** The shutdown path of [Ingestion](../design/03-ingestion.md#stop-cleanly-and-fail-loudly). One `CancellationToken` reaches every task, one `JoinSet` owns them, the writer commits what it holds, and the exit code is 0 on a signal and 1 on any failure.
-- **Files.** `crates/ingest/src/{supervisor.rs,read.rs,writer.rs,head.rs,error.rs}`, `bin/indexer/src/main.rs`, `crates/ingest/tests/shutdown.rs`.
+- **Files.** `crates/ingest/src/{supervisor.rs,read.rs,writer.rs,head.rs,error.rs}`, `crates/indexer/src/main.rs`, `crates/ingest/tests/shutdown.rs`.
 - **Shape.**
 
   ```rust
@@ -152,7 +152,7 @@ Configuration arrives in step 32. Until then the config types this stage needs, 
   }
   enum Event<R> { Cancelled, Deadline, Rows(BlockNumber, R), End, Closed }  // step 27's Event plus Cancelled
   async fn next_event<R>(rx: &mut mpsc::Receiver<ToWriter<R>>, deadline: Option<Instant>, token: &CancellationToken) -> Event<R> { todo!() }
-  async fn shutdown_signal() { todo!() }  // SIGTERM or SIGINT, in bin/indexer
+  async fn shutdown_signal() { todo!() }  // SIGTERM or SIGINT, in crates/indexer
   // added to RunnerError: #[error("a task panicked")] TaskPanicked(#[source] JoinError)
   ```
 
@@ -241,7 +241,7 @@ Configuration arrives in step 32. Until then the config types this stage needs, 
 ## Step 30. `feat(telemetry): log every commit and export progress metrics`
 
 - **Goal.** The progress log line, the spans of [Observability](../design/07-observability.md#name-spans-after-the-work), the optional OpenTelemetry export, the progress gauges, and the node call metrics on `/metrics`.
-- **Files.** `crates/telemetry/{Cargo.toml,src/lib.rs}`, calls in `crates/ingest/src/writer.rs` and `crates/chain/src/{lib.rs,rate.rs}`, `bin/indexer/src/main.rs`. Dependencies: see [the table](README.md#dependencies-by-step).
+- **Files.** `crates/telemetry/{Cargo.toml,src/lib.rs}`, calls in `crates/ingest/src/writer.rs` and `crates/chain/src/{lib.rs,rate.rs}`, `crates/indexer/src/main.rs`. Dependencies: see [the table](README.md#dependencies-by-step).
 - **Brief for the agent.** `bt_telemetry::init(&TelemetryConfig) -> Result<Guard, TelemetryError>` installs the `pretty` or `json` subscriber, a `tracing-opentelemetry` layer when `telemetry.otlp_endpoint` is set ([Observability](../design/07-observability.md#set-up-tracing-once)), and the Prometheus exporter on `telemetry.metrics_addr`. Write `pub struct TelemetryConfig { pub log_format: LogFormat, pub otlp_endpoint: Option<String>, pub metrics_addr: SocketAddr }` with `pub enum LogFormat { Pretty, Json }` and a `Default` that holds the defaults of [Ingestion](../design/03-ingestion.md#configuration). `Guard` holds the OpenTelemetry provider and flushes it on drop. `TelemetryError` is a `thiserror` enum with one variant each for the subscriber, the exporter, and the OTLP setup. The `metrics_addr` default is `0.0.0.0:9100`, which `ingest` uses, and `serve` overrides the default to `0.0.0.0:9101`, so both run on one host.
 
   `main` builds one `Chain` per job with `chain.for_worker(J::NAME)` and one for the head tracker with `chain.for_worker("head")`, so `Chain::call` can fill the `worker` label. The values share the source, the `Runtimes`, and the `RpcLimits` behind `Arc`. Add `pub fn for_worker(&self, worker: &'static str) -> Chain<S>`, and hold the source as `Arc<S>` for it (`spikes/crates/runner-live`, `two-jobs`). `Chain::call` counts each `Disconnected` result in `bt_rpc_disconnects_total` ([Error handling](../design/06-error-handling.md#classify-subxterror-when-it-enters-the-crate)), and `bt_rpc_permit_wait_seconds{worker}` times the whole wait in front of a call, for the permit and the rate token together ([Observability](../design/07-observability.md#node-and-database)).
@@ -269,7 +269,7 @@ Configuration arrives in step 32. Until then the config types this stage needs, 
   impl Default for ApiConfig { fn default() -> Self { todo!() } }  // listen_addr 0.0.0.0:8080, then 20, 64, 50
   #[derive(Clone)]
   pub struct AppState { db: PgPool, config: Arc<ApiConfig> }
-  impl AppState { pub fn new(db: PgPool, config: Arc<ApiConfig>) -> AppState { todo!() } }  // serve in bin/indexer builds it
+  impl AppState { pub fn new(db: PgPool, config: Arc<ApiConfig>) -> AppState { todo!() } }  // serve in crates/indexer builds it
   pub fn router(state: AppState) -> Router { todo!() }
   pub fn routes() -> Router<AppState> { todo!() }  // in ops: /status and /healthz, /readyz joins in step 50
   async fn status(State(s): State<AppState>) -> Result<Json<StatusDto>, ApiError> { todo!() }

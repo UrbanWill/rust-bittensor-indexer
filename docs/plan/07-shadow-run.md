@@ -5,7 +5,7 @@ This stage builds `bt-indexer compat diff`, which compares our five routes with 
 ## Step 53. `feat(cli): diff /pools against the squid at an aligned block`
 
 - **Goal.** `bt-indexer compat diff --squid <url> --route pools` finds our block whose `(netuid, total_tao, total_alpha)` set equals the squid's response, then prints every field that differs at that block ([diff live responses](../design/09-quality.md#diff-live-responses-against-the-squid)).
-- **Files.** `bin/indexer/src/compat_diff/{mod.rs,compare.rs,pools.rs}`, `crates/store/src/queries/pools.rs` (a query at a given block). Dependencies: see [the table](README.md#dependencies-by-step).
+- **Files.** `crates/indexer/src/compat_diff/{mod.rs,compare.rs,pools.rs}`, `crates/store/src/queries/pools.rs` (a query at a given block). Dependencies: see [the table](README.md#dependencies-by-step).
 - **Shape.**
 
   ```rust
@@ -34,7 +34,7 @@ This stage builds `bt-indexer compat diff`, which compares our five routes with 
 ## Step 54. `feat(cli): diff the validator and identity routes against the squid`
 
 - **Goal.** The other four routes, fetched only while both sides serve the same validator snapshot, with the deviations of [D28](../decisions.md#d28-anchor-apy-on-the-indexed-head-and-break-rank-ties-by-hotkey) and [D29](../decisions.md#d29-return-a-null-apy-where-the-squids-sql-errors) reported apart from the differences. The step also answers two open questions: the request headers tao-data-api sends under Cloudflare Workers, and whether a compat route needs `ValidatorPermit` or `Keys`.
-- **Files.** `bin/indexer/src/compat_diff/{validators.rs,identities.rs,stake.rs,deviation.rs}`.
+- **Files.** `crates/indexer/src/compat_diff/{validators.rs,identities.rs,stake.rs,deviation.rs}`.
 - **Shape.**
 
   ```rust
