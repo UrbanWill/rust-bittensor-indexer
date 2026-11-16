@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+bt-domain.workspace = true
 subxt.workspace = true
 thiserror.workspace = true
 

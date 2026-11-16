@@ -1,6 +1,7 @@
 //! The `bt-indexer` binary.
 
 use bt_chain::Chain;
+use bt_domain::BlockNumber;
 use clap::{Parser, Subcommand};
 
 /// Indexes the Bittensor chain.
@@ -28,7 +29,7 @@ enum ChainCmd {
         url: String,
         /// The block number. Omit it to use the finalized head.
         #[arg(long)]
-        block: Option<u64>,
+        block: Option<BlockNumber>,
     },
 }
 
@@ -42,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
             let s = chain.spec_at(block).await?;
             println!(
                 "block={} hash={:?} executed_by={} state={}",
-                s.number, s.hash, s.executed_by, s.state
+                s.number, s.hash, s.spec.executed_by, s.spec.state
             );
         }
     }

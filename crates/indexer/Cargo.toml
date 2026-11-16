@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 bt-chain.workspace = true
+bt-domain.workspace = true
 clap.workspace = true
 tokio.workspace = true
 

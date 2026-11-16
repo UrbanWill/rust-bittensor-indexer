@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/chain", "crates/indexer"]
+members = ["crates/chain", "crates/domain", "crates/indexer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,8 +9,10 @@ publish = false
 
 [workspace.dependencies]
 bt-chain = { path = "crates/chain" }
+bt-domain = { path = "crates/domain" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
 subxt = "=0.50.3"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

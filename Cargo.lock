@@ -525,7 +525,16 @@ dependencies = [
 name = "bt-chain"
 version = "0.1.0"
 dependencies = [
+ "bt-domain",
  "subxt",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bt-domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -535,6 +544,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bt-chain",
+ "bt-domain",
  "clap",
  "tokio",
 ]
