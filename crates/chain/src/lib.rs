@@ -4,9 +4,15 @@ use bt_domain::{BlockHash, BlockNumber, BlockRef, SpecAt, SpecVersion};
 use subxt::config::{Header, RpcConfigFor, SubstrateConfig};
 use subxt::rpcs::{LegacyRpcMethods, RpcClient};
 
+mod items;
+mod runtimes;
+pub use items::{Item, declares};
+pub use runtimes::{Decodes, Runtimes};
+
 /// A connection to one archive node.
 pub struct Chain {
     rpc: LegacyRpcMethods<RpcConfigFor<SubstrateConfig>>,
+    runtimes: Runtimes,
 }
 
 /// Errors from the node.
@@ -23,6 +29,7 @@ impl Chain {
         let client = RpcClient::from_url(url).await.map_err(unknown)?;
         Ok(Self {
             rpc: LegacyRpcMethods::new(client),
+            runtimes: Runtimes::default(),
         })
     }
 
