@@ -1,6 +1,7 @@
 //! Reads Bittensor chain data from an archive node.
 
 use bt_domain::{BlockRef, BlockState, SpecVersion, Timestamp};
+use subxt::ext::frame_decode::storage::encode_storage_key;
 
 mod decode;
 mod error;
@@ -32,29 +33,56 @@ pub enum ChainError {
 impl Chain<SubxtSource> {
     /// Connects to a node over a secure WebSocket.
     pub async fn connect(url: &str) -> Result<Self, ChainError> {
-        todo!()
+        Ok(Self::new(SubxtSource::connect(url).await?))
     }
 }
 
 impl<S: BlockSource> Chain<S> {
     /// Reads through `source`, with an empty metadata cache.
     pub fn new(source: S) -> Self {
-        todo!()
+        Self {
+            source,
+            runtimes: Runtimes::default(),
+        }
     }
 
     /// Returns the source.
     pub fn source(&self) -> &S {
-        todo!()
+        &self.source
     }
 
     /// Reads `Timestamp.Now` at `at`, with the spec whose metadata decoded it.
     pub async fn timestamp(&self, at: BlockRef) -> Result<(Timestamp, SpecVersion), ChainError> {
-        todo!()
+        let (spec, md) = self.metadata(at, Decodes::Storage).await?;
+        let fail = |reason: Box<dyn std::error::Error + Send + Sync>| DecodeError {
+            kind: DecodeKind::State,
+            block: at.number,
+            spec,
+            item: "Now",
+            reason,
+        };
+
+        let key = encode_storage_key("Timestamp", "Now", (), &*md, md.types())
+            .map_err(|e| fail(Box::new(e)))?;
+        let page = self
+            .source
+            .storage(at, StorageQuery::Keys(vec![key]))
+            .await?;
+
+        let bytes = page.entries.first().and_then(|(_, v)| v.as_deref());
+
+        let ms: u64 = decode::decode_value(&md, at, "Timestamp", "Now", bytes)?
+            .ok_or_else(|| fail("Timestamp.Now is not declared".into()))?;
+        let ms = i64::try_from(ms).map_err(|e| fail(Box::new(e)))?;
+        let ts = chrono::DateTime::from_timestamp_millis(ms)
+            .ok_or_else(|| fail("Timestamp out of range".into()))?;
+        Ok((Timestamp(ts), spec))
     }
 
     /// Reads the state every job records for `at`.
     pub async fn block_state(&self, at: BlockRef) -> Result<BlockState, ChainError> {
-        todo!()
+        let (ts, _) = self.timestamp(at).await?;
+        Ok(BlockState { at, ts })
     }
 }
 

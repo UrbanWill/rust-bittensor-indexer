@@ -8,6 +8,7 @@ publish.workspace = true
 bt-domain.workspace = true
 subxt.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
 
 [lints]
 workspace = true

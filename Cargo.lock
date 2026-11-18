@@ -535,6 +535,7 @@ name = "bt-chain"
 version = "0.1.0"
 dependencies = [
  "bt-domain",
+ "chrono",
  "subxt",
  "thiserror 2.0.21",
 ]
