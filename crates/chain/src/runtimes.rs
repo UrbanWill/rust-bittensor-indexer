@@ -1,12 +1,10 @@
 //! Fetches and caches runtime metadata per spec.
 
-use crate::{Chain, ChainError, unknown};
-use bt_domain::{BlockHash, BlockRef, SpecVersion};
+use crate::{BlockSource, Chain, ChainError, unknown};
+use bt_domain::{BlockRef, SpecVersion};
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
-use subxt::config::substrate::H256;
-use subxt::ext::codec::{Decode, Encode};
-use subxt::{ArcMetadata, Metadata};
+use subxt::ArcMetadata;
 
 /// Metadata fetched so far, one entry per spec. Clones share the same cache.
 #[derive(Clone, Default)]
@@ -38,7 +36,7 @@ pub enum Decodes {
     RuntimeApi,
 }
 
-impl Chain {
+impl<S: BlockSource> Chain<S> {
     /// Returns the metadata that a read of kind `of` at `at` decodes with, and the spec it belongs to.
     pub async fn metadata(
         &self,
@@ -60,9 +58,9 @@ impl Chain {
                     .number
                     .prev()
                     .ok_or_else(|| unknown(subxt::Error::other_str("block 0 has no parent")))?;
-                self.spec_at(Some(parent)).await?.hash
+                self.source.block_ref(parent).await?
             }
-            Decodes::RuntimeApi => at.hash,
+            Decodes::RuntimeApi => at,
         };
 
         let md = self.fetch_metadata(fetch_at).await?;
@@ -70,30 +68,8 @@ impl Chain {
         Ok((spec, md))
     }
 
-    async fn fetch_metadata(&self, hash: BlockHash) -> Result<ArcMetadata, ChainError> {
-        let at = Some(H256(hash.0));
-
-        let bytes = self
-            .rpc
-            .state_call("Metadata_metadata_versions", None, at)
-            .await
-            .map_err(unknown)?;
-        let versions = Vec::<u32>::decode(&mut bytes.as_slice()).map_err(unknown)?;
-        let version = versions
-            .into_iter()
-            .filter(|&v| v != u32::MAX)
-            .max()
-            .ok_or_else(|| unknown(subxt::Error::other_str("no stable metadata version")))?;
-
-        let bytes = self
-            .rpc
-            .state_call("Metadata_metadata_at_version", Some(&version.encode()), at)
-            .await
-            .map_err(unknown)?;
-        let opaque = Option::<Vec<u8>>::decode(&mut bytes.as_slice())
-            .map_err(unknown)?
-            .ok_or_else(|| unknown(subxt::Error::other_str("metadata version not served")))?;
-        let md = Metadata::decode(&mut opaque.as_slice()).map_err(unknown)?;
-        Ok(md.arc())
+    /// Fetches the highest stable metadata version at `at`, through `runtime_api`.
+    async fn fetch_metadata(&self, at: BlockRef) -> Result<ArcMetadata, ChainError> {
+        todo!()
     }
 }

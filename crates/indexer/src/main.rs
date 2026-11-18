@@ -1,7 +1,7 @@
 //! The `bt-indexer` binary.
 
-use bt_chain::{Chain, Decodes, Item, declares};
-use bt_domain::BlockNumber;
+use bt_chain::{BlockSource, Chain, Decodes, Item, declares};
+use bt_domain::{BlockNumber, BlockRef};
 use clap::{Parser, Subcommand};
 
 /// Indexes the Bittensor chain.
@@ -40,6 +40,23 @@ enum ChainCmd {
         #[arg(long)]
         block: Option<BlockNumber>,
     },
+    /// Print a block's specs and its timestamp, with the spec whose metadata decoded it.
+    Read {
+        /// The archive node's WebSocket URL.
+        #[arg(long, env = "BT_CHAIN__URLS")]
+        url: String,
+        /// The block number. Omit it to use the finalized head.
+        #[arg(long)]
+        block: Option<BlockNumber>,
+    },
+}
+
+/// Reads block `block`, or the finalized head when `block` is `None`.
+async fn block_at<S: BlockSource>(
+    chain: &Chain<S>,
+    block: Option<BlockNumber>,
+) -> anyhow::Result<BlockRef> {
+    todo!()
 }
 
 #[tokio::main]
@@ -49,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
             cmd: ChainCmd::Spec { url, block },
         } => {
             let chain = Chain::connect(&url).await?;
-            let s = chain.spec_at(block).await?;
+            let s = block_at(&chain, block).await?;
             println!(
                 "block={} hash={:?} executed_by={} state={}",
                 s.number, s.hash, s.spec.executed_by, s.spec.state
@@ -59,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             cmd: ChainCmd::Metadata { url, block },
         } => {
             let chain = Chain::connect(&url).await?;
-            let at = chain.spec_at(block).await?;
+            let at = block_at(&chain, block).await?;
             let (spec, md) = chain.metadata(at, Decodes::RuntimeApi).await?;
             let yn = |b: bool| if b { "yes" } else { "no" };
             println!(
@@ -70,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
                     Item::Api("SwapRuntimeApi", "current_alpha_price_all")
                 )),
             );
+        }
+        Cmd::Chain {
+            cmd: ChainCmd::Read { url, block },
+        } => {
+            todo!()
         }
     }
     Ok(())
