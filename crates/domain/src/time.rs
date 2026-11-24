@@ -10,6 +10,6 @@ pub struct Timestamp(pub DateTime<Utc>);
 impl fmt::Display for Timestamp {
     /// Prints RFC 3339 to the second, such as `2025-02-13T21:40:36Z`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        write!(f, "{}", self.0.format("%Y-%m-%dT%H:%M:%SZ"))
     }
 }

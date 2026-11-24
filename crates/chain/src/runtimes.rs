@@ -1,10 +1,13 @@
 //! Fetches and caches runtime metadata per spec.
 
+use crate::RuntimeCall;
 use crate::{BlockSource, Chain, ChainError, unknown};
 use bt_domain::{BlockRef, SpecVersion};
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use subxt::ArcMetadata;
+use subxt::Metadata;
+use subxt::ext::codec::{Decode, Encode};
 
 /// Metadata fetched so far, one entry per spec. Clones share the same cache.
 #[derive(Clone, Default)]
@@ -70,6 +73,28 @@ impl<S: BlockSource> Chain<S> {
 
     /// Fetches the highest stable metadata version at `at`, through `runtime_api`.
     async fn fetch_metadata(&self, at: BlockRef) -> Result<ArcMetadata, ChainError> {
-        todo!()
+        let versions = RuntimeCall {
+            name: "Metadata_metadata_versions".to_owned(),
+            args: vec![],
+        };
+        let bytes = self.source.runtime_api(at, versions).await?;
+        let version = Vec::<u32>::decode(&mut bytes.as_slice())
+            .map_err(unknown)?
+            .into_iter()
+            .filter(|&v| v != u32::MAX)
+            .max()
+            .ok_or_else(|| unknown(subxt::Error::other_str("no stable metadata version")))?;
+
+        let at_version = RuntimeCall {
+            name: "Metadata_metadata_at_version".to_owned(),
+            args: version.encode(),
+        };
+        let bytes = self.source.runtime_api(at, at_version).await?;
+        let opaque = Option::<Vec<u8>>::decode(&mut bytes.as_slice())
+            .map_err(unknown)?
+            .ok_or_else(|| unknown(subxt::Error::other_str("metadata version not served")))?;
+        let md = Metadata::decode(&mut opaque.as_slice()).map_err(unknown)?;
+
+        Ok(md.arc())
     }
 }

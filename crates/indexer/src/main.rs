@@ -56,7 +56,12 @@ async fn block_at<S: BlockSource>(
     chain: &Chain<S>,
     block: Option<BlockNumber>,
 ) -> anyhow::Result<BlockRef> {
-    todo!()
+    let at = match block {
+        Some(n) => chain.source().block_ref(n).await?,
+        None => chain.source().finalized_head().await?,
+    };
+
+    Ok(at)
 }
 
 #[tokio::main]
@@ -91,7 +96,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Chain {
             cmd: ChainCmd::Read { url, block },
         } => {
-            todo!()
+            let chain = Chain::connect(&url).await?;
+            let at = block_at(&chain, block).await?;
+            let (ts, spec) = chain.timestamp(at).await?;
+            println!(
+                "executed_by={} state={} decoded_with={spec} ts={ts}",
+                at.spec.executed_by, at.spec.state
+            )
         }
     }
     Ok(())
